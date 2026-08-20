@@ -68,7 +68,11 @@ fun LanDiscoveryScreen(
     onCancelScan: () -> Unit,
     onRefreshNetwork: () -> Unit,
     onFilter: (String) -> Unit,
-    onSelectDevice: (String?) -> Unit
+    onSelectDevice: (String?) -> Unit,
+    onScanDevicePorts: (String) -> Unit,
+    onCancelPortScan: () -> Unit,
+    onStartMonitoring: (String) -> Unit,
+    onStopMonitoring: () -> Unit
 ) {
     Scaffold(
         containerColor = LanPage,
@@ -127,7 +131,17 @@ fun LanDiscoveryScreen(
     }
 
     state.selectedDevice?.let { device ->
-        DeviceDetailDialog(device = device, onDismiss = { onSelectDevice(null) })
+        DeviceDetailDialog(
+            device = device,
+            portScan = state.portScanStates[device.id],
+            onlineResult = state.onlineStates[device.id],
+            isMonitoring = state.monitoredDeviceId == device.id,
+            onScanPorts = { onScanDevicePorts(device.id) },
+            onCancelPortScan = onCancelPortScan,
+            onStartMonitoring = { onStartMonitoring(device.id) },
+            onStopMonitoring = onStopMonitoring,
+            onDismiss = { onSelectDevice(null) }
+        )
     }
 }
 
@@ -348,7 +362,18 @@ private fun PrivacyFootnote() {
 }
 
 @Composable
-private fun DeviceDetailDialog(device: LanDevice, onDismiss: () -> Unit) {
+private fun DeviceDetailDialog(
+    device: LanDevice,
+    portScan: DevicePortScanUiState?,
+    onlineResult: DeviceOnlineResult?,
+    isMonitoring: Boolean,
+    onScanPorts: () -> Unit,
+    onCancelPortScan: () -> Unit,
+    onStartMonitoring: () -> Unit,
+    onStopMonitoring: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val scanState = portScan ?: DevicePortScanUiState()
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
@@ -361,10 +386,63 @@ private fun DeviceDetailDialog(device: LanDevice, onDismiss: () -> Unit) {
                 device.hostname?.let { DeviceDetailRow("主机名", it) }
                 DeviceDetailRow("发现方式", device.sources.joinToString("、"))
                 if (device.services.isNotEmpty()) DeviceDetailRow("公开服务", device.services.joinToString("、"))
-                if (device.ports.isNotEmpty()) DeviceDetailRow("响应端口", device.ports.sorted().joinToString(", "))
+                if (device.ports.isNotEmpty()) DeviceDetailRow("发现时响应端口", device.ports.sorted().joinToString(", "))
                 device.manufacturer?.let { DeviceDetailRow("厂商 / 型号", it) }
                 device.details.toSortedMap().forEach { (key, value) ->
                     if (value.isNotBlank()) DeviceDetailRow(key, value)
+                }
+
+                Spacer(Modifier.height(8.dp))
+                HorizontalDivider(color = LanLine)
+                Spacer(Modifier.height(14.dp))
+                Text("端口扫描", color = LanBlueDark, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Spacer(Modifier.height(4.dp))
+                Text("仅检查此已发现设备的 14 个常见服务端口；不发送协议载荷或认证请求。", color = LanMuted, fontSize = 12.sp, lineHeight = 17.sp)
+                Spacer(Modifier.height(10.dp))
+                if (scanState.isScanning) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
+                    Spacer(Modifier.height(6.dp))
+                    Text("${scanState.message ?: "正在扫描"} · ${scanState.completedPorts}/${scanState.totalPorts}", color = LanMuted, fontSize = 12.sp)
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = onCancelPortScan, modifier = Modifier.fillMaxWidth()) { Text("停止端口扫描") }
+                } else {
+                    Button(
+                        onClick = onScanPorts,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = LanBlue)
+                    ) { Text("扫描 14 个常见端口") }
+                }
+                scanState.result?.let { result ->
+                    Spacer(Modifier.height(7.dp))
+                    result.errorMessage?.let { DeviceDetailRow("扫描状态", it) }
+                    if (result.errorMessage == null) {
+                        val open = result.openServices.joinToString("、") { "${it.label} (${it.port})" }
+                        DeviceDetailRow("开放端口", open.ifBlank { "未检测到开放的常见服务端口" })
+                        DeviceDetailRow("扫描范围", result.checkedServices.joinToString("、") { it.port.toString() })
+                    }
+                }
+
+                Spacer(Modifier.height(8.dp))
+                HorizontalDivider(color = LanLine)
+                Spacer(Modifier.height(14.dp))
+                Text("在线状态监测", color = LanBlueDark, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    StatusBadge(onlineResult?.status?.label ?: DeviceOnlineStatus.Unknown.label, onlineResult?.status == DeviceOnlineStatus.Online)
+                    Spacer(Modifier.width(8.dp))
+                    Text(onlineResult?.detail ?: "尚未检查此设备的连通性", color = LanMuted, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                }
+                Spacer(Modifier.height(8.dp))
+                Text("开启后仅在应用前台每 15 秒检查一次已知常见服务端口；无响应不代表设备一定离线。", color = LanMuted, fontSize = 12.sp, lineHeight = 17.sp)
+                Spacer(Modifier.height(9.dp))
+                if (isMonitoring) {
+                    OutlinedButton(onClick = onStopMonitoring, modifier = Modifier.fillMaxWidth()) { Text("停止在线监测") }
+                } else {
+                    Button(
+                        onClick = onStartMonitoring,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = LanSuccess)
+                    ) { Text("开始在线监测") }
                 }
             }
         }

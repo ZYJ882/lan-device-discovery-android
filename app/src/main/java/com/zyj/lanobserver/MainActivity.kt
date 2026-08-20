@@ -33,7 +33,11 @@ class MainActivity : ComponentActivity() {
                     onCancelScan = viewModel::cancelScan,
                     onRefreshNetwork = viewModel::refreshNetwork,
                     onFilter = viewModel::filter,
-                    onSelectDevice = viewModel::selectDevice
+                    onSelectDevice = viewModel::selectDevice,
+                    onScanDevicePorts = viewModel::scanDevicePorts,
+                    onCancelPortScan = viewModel::cancelPortScan,
+                    onStartMonitoring = viewModel::startMonitoring,
+                    onStopMonitoring = viewModel::stopMonitoring
                 )
             }
         }
