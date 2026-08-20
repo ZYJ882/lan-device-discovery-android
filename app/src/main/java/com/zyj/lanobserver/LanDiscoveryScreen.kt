@@ -180,8 +180,20 @@ private fun NetworkOverviewCard(
                 OutlinedButton(onClick = onRefreshNetwork, modifier = Modifier.fillMaxWidth()) { Text("重新检测网络") }
             } else {
                 NetworkValueRow("本机 IP", network.localIp)
-                NetworkValueRow("默认网关", network.gateway ?: "未获取")
+                NetworkValueRow(if (network.isHotspot) "热点网关" else "默认网关", network.gateway ?: "未获取")
                 NetworkValueRow("网络范围", network.actualCidr)
+                if (network.isHotspot) {
+                    Spacer(Modifier.height(5.dp))
+                    Surface(color = LanSuccessBg, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            "热点模式：扫描已接入设备公开的 mDNS、UPnP 与常见服务；未显示不代表设备未连接。",
+                            color = LanSuccess,
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                        )
+                    }
+                }
                 if (network.actualCidr != network.scanCidr) {
                     NetworkValueRow("本次扫描", "${network.scanCidr}（限制为本机 /24）")
                 }
@@ -203,7 +215,7 @@ private fun NetworkOverviewCard(
                         onClick = onStartScan,
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(containerColor = LanBlue)
-                    ) { Text("开始发现设备") }
+                    ) { Text(if (network.isHotspot) "扫描热点设备" else "开始发现设备") }
                 }
             }
         }

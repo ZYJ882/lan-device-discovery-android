@@ -25,6 +25,7 @@ import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.Socket
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
@@ -43,34 +44,94 @@ class LanDiscoveryEngine(context: Context) {
     private val wifiManager = appContext.applicationContext.getSystemService(WifiManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    /**
+     * 优先返回本机移动热点的下游接口；热点未开启时，返回应用的活动局域网接口。
+     *
+     * 普通应用不能可靠读取系统 DHCP 客户端表，因此热点客户端仍通过其公开服务响应来发现。
+     */
     fun networkSnapshot(): LanNetworkSnapshot? {
-        val network = connectivityManager.activeNetwork ?: return null
-        val properties = connectivityManager.getLinkProperties(network) ?: return null
-        val capabilities = connectivityManager.getNetworkCapabilities(network)
-        val localAddress = properties.linkAddresses
-            .firstOrNull { address -> address.address is Inet4Address && !address.address.isLoopbackAddress }
-            ?: return null
-        val address = localAddress.address as Inet4Address
-        val subnet = Ipv4Subnet.from(address, localAddress.prefixLength)
-        val gateway = properties.routes
-            .firstOrNull { route -> route.destination.prefixLength == 0 && route.gateway is Inet4Address }
-            ?.gateway
-            ?.hostAddress
+        val activeNetwork = connectivityManager.activeNetwork
+        val activeProperties = activeNetwork?.let { connectivityManager.getLinkProperties(it) }
+        val activeCapabilities = activeNetwork?.let { connectivityManager.getNetworkCapabilities(it) }
+        val activeSnapshot = activeProperties?.let { properties ->
+            val localAddress = properties.linkAddresses
+                .firstOrNull { address -> address.address is Inet4Address && !address.address.isLoopbackAddress }
+                ?: return@let null
+            val address = localAddress.address as Inet4Address
+            val subnet = Ipv4Subnet.from(address, localAddress.prefixLength)
+            val gateway = properties.routes
+                .firstOrNull { route -> route.destination.prefixLength == 0 && route.gateway is Inet4Address }
+                ?.gateway
+                ?.hostAddress
+            LanNetworkSnapshot(
+                localIp = address.hostAddress.orEmpty(),
+                gateway = gateway,
+                interfaceName = properties.interfaceName.orEmpty(),
+                transport = when {
+                    activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> "Wi‑Fi"
+                    activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true -> "以太网"
+                    activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true -> "VPN"
+                    else -> "当前网络"
+                },
+                actualCidr = subnet.cidrLabel,
+                scanCidr = subnet.scanCidrLabel,
+                subnet = subnet,
+                isHotspot = false
+            )
+        }
+        return hotspotSnapshot(activeSnapshot, activeCapabilities) ?: activeSnapshot
+    }
+
+    private fun hotspotSnapshot(
+        activeSnapshot: LanNetworkSnapshot?,
+        activeCapabilities: NetworkCapabilities?
+    ): LanNetworkSnapshot? {
+        val interfaces = runCatching { NetworkInterface.getNetworkInterfaces() }.getOrNull() ?: return null
+        val activeIsCellular = activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
+        var bestCandidate: HotspotInterfaceCandidate? = null
+        while (interfaces.hasMoreElements()) {
+            val networkInterface = interfaces.nextElement()
+            if (!runCatching { networkInterface.isUp && !networkInterface.isLoopback }.getOrDefault(false)) continue
+            val name = networkInterface.name.orEmpty().lowercase()
+            val address = networkInterface.interfaceAddresses
+                .firstOrNull { item -> item.address is Inet4Address && item.address.isSiteLocalAddress }
+                ?: continue
+            val score = hotspotCandidateScore(name, activeSnapshot?.interfaceName, activeIsCellular)
+            if (score <= 0) continue
+            val candidate = HotspotInterfaceCandidate(networkInterface.name, address.address as Inet4Address, address.networkPrefixLength, score)
+            if (bestCandidate == null || candidate.score > bestCandidate.score) bestCandidate = candidate
+        }
+        val candidate = bestCandidate ?: return null
+        val subnet = Ipv4Subnet.from(candidate.address, candidate.prefixLength.toInt())
         return LanNetworkSnapshot(
-            localIp = address.hostAddress.orEmpty(),
-            gateway = gateway,
-            interfaceName = properties.interfaceName.orEmpty(),
-            transport = when {
-                capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> "Wi‑Fi"
-                capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true -> "以太网"
-                capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true -> "VPN"
-                else -> "当前网络"
-            },
+            localIp = candidate.address.hostAddress.orEmpty(),
+            gateway = candidate.address.hostAddress,
+            interfaceName = candidate.interfaceName,
+            transport = "移动热点",
             actualCidr = subnet.cidrLabel,
             scanCidr = subnet.scanCidrLabel,
-            subnet = subnet
+            subnet = subnet,
+            isHotspot = true
         )
     }
+
+    private fun hotspotCandidateScore(
+        interfaceName: String,
+        activeInterfaceName: String?,
+        activeIsCellular: Boolean
+    ): Int = when {
+        interfaceName.contains("softap") || interfaceName.startsWith("ap") || interfaceName.contains("tether") -> 100
+        activeIsCellular && (interfaceName.startsWith("wlan") || interfaceName.startsWith("wifi")) -> 80
+        activeIsCellular && interfaceName != activeInterfaceName?.lowercase() -> 60
+        else -> 0
+    }
+
+    private data class HotspotInterfaceCandidate(
+        val interfaceName: String,
+        val address: Inet4Address,
+        val prefixLength: Short,
+        val score: Int
+    )
 
     suspend fun scan(
         snapshot: LanNetworkSnapshot,
@@ -82,22 +143,31 @@ class LanDiscoveryEngine(context: Context) {
         registry.upsert(
             LanDevice(
                 id = "local:${snapshot.localIp}",
-                displayName = "本机",
+                displayName = if (snapshot.isHotspot) "本机热点" else "本机",
                 hostname = null,
                 addresses = setOf(snapshot.localIp),
                 ports = emptySet(),
-                services = setOf("本机"),
-                sources = setOf("本机网络信息"),
+                services = setOf(if (snapshot.isHotspot) "热点网关" else "本机"),
+                sources = setOf(if (snapshot.isHotspot) "本机热点网络信息" else "本机网络信息"),
                 manufacturer = null,
                 deviceHint = "Android 设备",
-                details = mapOf("网络接口" to snapshot.interfaceName),
+                details = mapOf(
+                    "网络接口" to snapshot.interfaceName,
+                    "网络模式" to if (snapshot.isHotspot) "移动热点" else snapshot.transport
+                ),
                 lastSeenAt = startedAt
             )
         )
 
         val multicastLock = acquireMulticastLock()
         try {
-            onProgress(LanScanProgress("正在查找 mDNS、UPnP 及常见网络服务", 0, snapshot.subnet.scanHosts().size))
+            onProgress(
+                LanScanProgress(
+                    if (snapshot.isHotspot) "正在查找热点客户端的公开网络服务" else "正在查找 mDNS、UPnP 及常见网络服务",
+                    0,
+                    snapshot.subnet.scanHosts().size
+                )
+            )
             val mdns = async(Dispatchers.IO) {
                 discoverMdns(registry)
             }
@@ -392,7 +462,8 @@ data class LanNetworkSnapshot(
     val transport: String,
     val actualCidr: String,
     val scanCidr: String,
-    val subnet: Ipv4Subnet
+    val subnet: Ipv4Subnet,
+    val isHotspot: Boolean = false
 )
 
 data class LanScanProgress(

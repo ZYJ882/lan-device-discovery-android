@@ -16,6 +16,7 @@ Android 的网络服务发现（NSD）基于 DNS-SD，可识别局域网中公�
 | UPnP / SSDP | 发送标准 `M-SEARCH` 请求并接收短时间响应 | `SERVER`、`ST`、`USN`、`LOCATION` 等公开响应头 | 仅发现启用 UPnP 且允许多播响应的设备 |
 | 常见服务连通性 | 对当前子网内地址进行低频 TCP 连通性检查 | IP、响应端口及基于服务的设备类别 | 仅检查 22、80、443、445、631、9100；不发送应用层请求 |
 | 本机网络概览 | 读取当前活动网络的链路属性 | 本机 IPv4、网关、接口、实际 CIDR 与扫描 CIDR | 不读取 Wi‑Fi SSID、密码或定位数据 |
+| 移动热点子网 | 优先识别本机私有 IPv4 热点网关接口，再复用 mDNS、SSDP 与常见服务检查 | 热点网关 IP、热点子网、响应设备的公开服务 | 普通应用不读取系统 DHCP 客户端表；仅显示实际响应的热点设备 |
 
 为避免在大型组织网络中产生过多连接，若当前网络比 `/24` 更大，应用只探测**本机所在的 `/24` 子网**。列表中的“未发现”不表示设备离线；客户端隔离、访客网络、防火墙、休眠、IPv6-only 网络和未公开服务都可能使设备不响应。
 
@@ -30,6 +31,13 @@ Android 的网络服务发现（NSD）基于 DNS-SD，可识别局域网中公�
 | 5 | 点击“停止扫描” | 立即停止后续扫描，并保留当前已发现的列表 |
 | 6 | 打开已发现设备的详情并点击“扫描 14 个常见端口” | 仅对该设备的已发现 IPv4 地址建立短时 TCP 连接，并列出响应端口 |
 | 7 | 点击“开始在线监测” | 应用前台每 15 秒检查一次该设备的已知常见服务端口；可随时停止 |
+| 8 | 开启本机移动热点后返回应用 | 顶部网络卡片显示“移动热点”，点击“扫描热点设备”以识别响应设备 |
+
+## 移动热点设备识别
+
+当手机开启移动热点时，系统的默认网络通常仍为蜂窝数据，热点下游接口未必是应用的默认网络。本应用会枚举本机可见的私有 IPv4 接口，结合接口名称和当前蜂窝上游状态选择热点网关候选，并将扫描范围限定为该网关所属的 `/24` 子网。Android 的网络状态接口可提供网络、链路地址、路由和接口信息；应用不依赖固定的 `192.168.43.0/24` 地址段。[2]
+
+Android 的热点系统可管理关联客户端，但完整的 Soft AP 客户端控制能力在一些设备和 API 上属于系统受限能力。因此，应用不尝试读取系统 DHCP 租约、客户端 MAC 地址或连接管理列表，而是通过设备自行公开的 mDNS、UPnP/SSDP 和受控 TCP 连通性响应发现热点中的设备。[4] 某台已经接入热点的设备如果未公开服务、被客户端隔离、处于休眠或受防火墙限制，可能不会显示；这不等于它没有连接热点。
 
 ## 单设备端口扫描与在线监测
 
@@ -68,3 +76,5 @@ export ANDROID_HOME=/path/to/android-sdk
 [2] [Android Developers：Read network state](https://developer.android.com/develop/connectivity/network-ops/reading-network-state)
 
 [3] [Android Developers：Local network permission](https://developer.android.com/privacy-and-security/local-network-permission)
+
+[4] [Android Open Source Project：Wi-Fi hotspot (Soft AP)](https://source.android.com/docs/core/connect/wifi-softap)

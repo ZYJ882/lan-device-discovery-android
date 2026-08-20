@@ -49,6 +49,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
             message = when {
                 snapshot == null -> "未检测到可用于局域网扫描的 IPv4 网络。请连接 Wi‑Fi 或以太网后重试。"
                 uiState.isScanning -> uiState.message
+                snapshot.isHotspot -> "已识别本机移动热点。扫描将只读取热点客户端公开广播与常见服务连通性。"
                 else -> "已准备就绪。扫描只读取设备公开广播与常见服务连通性。"
             }
         )
@@ -72,7 +73,11 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
             lastScanLabel = null,
             portScanStates = emptyMap(),
             onlineStates = emptyMap(),
-            message = "正在扫描 ${snapshot.scanCidr}。不会发送登录请求、读取文件或执行远程命令。"
+            message = if (snapshot.isHotspot) {
+                "正在扫描热点子网 ${snapshot.scanCidr} 中设备公开的网络服务；未发现不代表设备未连接。"
+            } else {
+                "正在扫描 ${snapshot.scanCidr}。不会发送登录请求、读取文件或执行远程命令。"
+            }
         )
         scanJob = viewModelScope.launch {
             try {
@@ -88,7 +93,11 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
                     isScanning = false,
                     progress = null,
                     lastScanLabel = "上次扫描：$finishedLabel",
-                    message = "扫描完成：在 ${summary.scannedHostCount} 个可检查地址中发现 ${summary.discoveredCount} 台设备。未响应不代表设备不存在。"
+                    message = if (snapshot.isHotspot) {
+                        "热点扫描完成：在 ${summary.scannedHostCount} 个可检查地址中发现 ${summary.discoveredCount} 台响应设备。未显示不代表设备未连接。"
+                    } else {
+                        "扫描完成：在 ${summary.scannedHostCount} 个可检查地址中发现 ${summary.discoveredCount} 台设备。未响应不代表设备不存在。"
+                    }
                 )
             } catch (exception: SecurityException) {
                 uiState = uiState.copy(
@@ -235,7 +244,8 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
         gateway = gateway,
         transport = transport,
         actualCidr = actualCidr,
-        scanCidr = scanCidr
+        scanCidr = scanCidr,
+        isHotspot = isHotspot
     )
 
     private companion object {
@@ -289,5 +299,6 @@ data class LanNetworkUi(
     val gateway: String?,
     val transport: String,
     val actualCidr: String,
-    val scanCidr: String
+    val scanCidr: String,
+    val isHotspot: Boolean = false
 )
