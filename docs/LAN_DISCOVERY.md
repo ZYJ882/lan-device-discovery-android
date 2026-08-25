@@ -12,9 +12,9 @@ Android 的网络服务发现（NSD）基于 DNS-SD，可识别局域网中公�
 
 | 机制 | 实现内容 | 可显示的信息 | 边界 |
 |---|---|---|---|
-| mDNS / DNS-SD | 查找 HTTP、HTTPS、打印、AirPlay、Google Cast、SSH、SMB 等公开服务类型 | 服务实例、IP、端口、TXT 元数据、型号或厂商字段 | 仅发现主动广播相应 DNS-SD 服务的设备 |
-| UPnP / SSDP | 发送标准 `M-SEARCH` 请求并接收短时间响应 | `SERVER`、`ST`、`USN`、`LOCATION` 等公开响应头 | 仅发现启用 UPnP 且允许多播响应的设备 |
-| 常见服务连通性 | 对当前子网内地址进行低频 TCP 连通性检查 | IP、响应端口及基于服务的设备类别 | 仅检查 22、80、443、445、631、9100；不发送应用层请求 |
+| mDNS / DNS-SD | 查找 HTTP、HTTPS、打印、AirPlay、Google Cast、SSH、SMB 等公开服务类型 | 服务实例、IP、端口、TXT 元数据、公开型号或厂商字段 | 仅发现主动广播相应 DNS-SD 服务的设备 |
+| UPnP / SSDP | 发送标准 `M-SEARCH` 请求并接收短时间响应；可读取同一响应地址的公开描述文档 | `SERVER`、`ST`、`USN`、`LOCATION`、friendlyName、manufacturer、modelName、modelNumber | 仅处理设备自己公开的 HTTP 描述文档；拒绝跨主机、重定向和超限内容 |
+| 常见服务连通性 | 对普通局域网内地址进行低频 TCP 连通性检查 | IP、响应端口及低置信度服务特征 | 仅检查 22、80、443、445、631、9100；热点或 VPN 存在时禁用，防止中间层虚假连接 |
 | 本机网络概览 | 读取当前活动网络的链路属性 | 本机 IPv4、网关、接口、实际 CIDR 与扫描 CIDR | 不读取 Wi‑Fi SSID、密码或定位数据 |
 | 移动热点子网 | 优先识别本机私有 IPv4 热点网关接口，再复用 mDNS、SSDP 与常见服务检查 | 热点网关 IP、热点子网、响应设备的公开服务 | 普通应用不读取系统 DHCP 客户端表；仅显示实际响应的热点设备 |
 
@@ -37,7 +37,13 @@ Android 的网络服务发现（NSD）基于 DNS-SD，可识别局域网中公�
 
 当手机开启移动热点时，系统的默认网络通常仍为蜂窝数据，热点下游接口未必是应用的默认网络。本应用会枚举本机可见的私有 IPv4 接口，结合接口名称和当前蜂窝上游状态选择热点网关候选，并将扫描范围限定为该网关所属的 `/24` 子网。Android 的网络状态接口可提供网络、链路地址、路由和接口信息；应用不依赖固定的 `192.168.43.0/24` 地址段。[2]
 
-Android 的热点系统可管理关联客户端，但完整的 Soft AP 客户端控制能力在一些设备和 API 上属于系统受限能力。因此，应用不尝试读取系统 DHCP 租约、客户端 MAC 地址或连接管理列表，而是通过设备自行公开的 mDNS、UPnP/SSDP 和受控 TCP 连通性响应发现热点中的设备。[4] 某台已经接入热点的设备如果未公开服务、被客户端隔离、处于休眠或受防火墙限制，可能不会显示；这不等于它没有连接热点。
+Android 的热点系统可管理关联客户端，但完整的 Soft AP 客户端控制能力在一些设备和 API 上属于系统受限能力。因此，应用不尝试读取系统 DHCP 租约、客户端 MAC 地址或连接管理列表，而是通过设备自行公开的 mDNS、UPnP/SSDP 响应发现热点中的设备。[4] 为避免 VPN、透明代理或中间层使每个私有 IP 的 TCP `connect()` 都显示成功，热点或 VPN 存在时应用会禁用 TCP 子网扫掠。某台已经接入热点的设备如果未公开服务、被客户端隔离、处于休眠或受防火墙限制，可能不会显示；这不等于它没有连接热点。
+
+## 设备名称、厂商与型号识别
+
+应用只显示设备**主动公开**的身份信息。mDNS TXT 记录可携带 `model`、`manufacturer`、`ty` 或实例名；SSDP 的 `LOCATION` 若指向同一响应地址的 HTTP 描述文档，应用会在短超时和 64 KiB 大小限制内解析 `friendlyName`、`manufacturer`、`modelName`、`modelNumber`、`modelDescription` 与 `deviceType`。这些字段会作为“公开厂商”“公开型号”等信息显示，未公开时则显示“未识别”，不会用端口猜测伪造具体型号。[1] [4]
+
+ARP 与 MAC-OUI 不是普通 Android APK 的可靠基础。Android 10 后，对 `/proc/net` 中 ARP 信息的访问受到平台限制，且 Android 10 及以上设备默认可使用随机 MAC 地址；随机 MAC 的厂商前缀不能反映真实硬件制造商。[5] [6] 因此本应用不收集 MAC 地址，也不以 OUI 数据库生成“厂商/型号”结论。
 
 ## 单设备端口扫描与在线监测
 
@@ -78,3 +84,7 @@ export ANDROID_HOME=/path/to/android-sdk
 [3] [Android Developers：Local network permission](https://developer.android.com/privacy-and-security/local-network-permission)
 
 [4] [Android Open Source Project：Wi-Fi hotspot (Soft AP)](https://source.android.com/docs/core/connect/wifi-softap)
+
+[5] [Google Issue Tracker：access to /proc/net/arp to resolve mac address of an IP address](https://issuetracker.google.com/issues/128554635)
+
+[6] [Android Open Source Project：MAC randomization behavior](https://source.android.com/docs/core/connect/wifi-mac-randomization-behavior)

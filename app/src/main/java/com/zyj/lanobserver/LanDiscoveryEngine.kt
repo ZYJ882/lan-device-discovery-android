@@ -43,6 +43,8 @@ class LanDiscoveryEngine(context: Context) {
     private val nsdManager = appContext.getSystemService(NsdManager::class.java)
     private val wifiManager = appContext.applicationContext.getSystemService(WifiManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val identityResolver = DeviceIdentityResolver()
+    private val upnpIdentityCache = ConcurrentHashMap<String, PublicDeviceIdentity>()
 
     /**
      * 优先返回本机移动热点的下游接口；热点未开启时，返回应用的活动局域网接口。
@@ -76,7 +78,8 @@ class LanDiscoveryEngine(context: Context) {
                 actualCidr = subnet.cidrLabel,
                 scanCidr = subnet.scanCidrLabel,
                 subnet = subnet,
-                isHotspot = false
+                isHotspot = false,
+                hasVpn = activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
             )
         }
         return hotspotSnapshot(activeSnapshot, activeCapabilities) ?: activeSnapshot
@@ -111,7 +114,8 @@ class LanDiscoveryEngine(context: Context) {
             actualCidr = subnet.cidrLabel,
             scanCidr = subnet.scanCidrLabel,
             subnet = subnet,
-            isHotspot = true
+            isHotspot = true,
+            hasVpn = activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
         )
     }
 
@@ -159,13 +163,21 @@ class LanDiscoveryEngine(context: Context) {
             )
         )
 
+        // 热点下游流量可能被系统或 VPN 中间层处理。对整个子网做裸 TCP connect 会把
+        // 中间层接受的连接误判为目标设备开放端口，因此热点和 VPN 场景只采用真实广播响应。
+        val canSweepTcp = !snapshot.isHotspot && !snapshot.hasVpn
+        val tcpHostCount = if (canSweepTcp) snapshot.subnet.scanHosts().size else 0
         val multicastLock = acquireMulticastLock()
         try {
             onProgress(
                 LanScanProgress(
-                    if (snapshot.isHotspot) "正在查找热点客户端的公开网络服务" else "正在查找 mDNS、UPnP 及常见网络服务",
+                    when {
+                        snapshot.isHotspot -> "正在查找热点客户端公开的 mDNS 与 UPnP 服务"
+                        snapshot.hasVpn -> "检测到 VPN，已跳过 TCP 子网扫掠以避免误报"
+                        else -> "正在查找 mDNS、UPnP 及常见网络服务"
+                    },
                     0,
-                    snapshot.subnet.scanHosts().size
+                    tcpHostCount
                 )
             )
             val mdns = async(Dispatchers.IO) {
@@ -175,14 +187,14 @@ class LanDiscoveryEngine(context: Context) {
                 discoverSsdp(registry)
             }
             val tcp = async(Dispatchers.IO) {
-                probeCommonServices(snapshot, registry, onProgress)
+                if (canSweepTcp) probeCommonServices(snapshot, registry, onProgress)
             }
             awaitAll(mdns, ssdp, tcp)
             LanScanSummary(
                 startedAt = startedAt,
                 finishedAt = System.currentTimeMillis(),
                 discoveredCount = registry.snapshot().size,
-                scannedHostCount = snapshot.subnet.scanHosts().size
+                scannedHostCount = tcpHostCount
             )
         } finally {
             multicastLock?.let { lock -> if (lock.isHeld) lock.release() }
@@ -322,18 +334,25 @@ class LanDiscoveryEngine(context: Context) {
                         val address = response.address.hostAddress.orEmpty()
                         val server = headers["server"]
                         val type = headers["st"] ?: headers["nt"] ?: "UPnP 设备"
+                        val location = headers["location"]
+                        val cacheKey = "$address|${location.orEmpty()}"
+                        val identity = location?.let { publicLocation ->
+                            upnpIdentityCache[cacheKey] ?: identityResolver
+                                .resolveUpnpDescription(publicLocation, address)
+                                ?.also { resolved -> upnpIdentityCache[cacheKey] = resolved }
+                        }
                         registry.upsert(
                             LanDevice(
                                 id = "ip:$address",
-                                displayName = server ?: type,
+                                displayName = identity?.friendlyName ?: identity?.modelName ?: server ?: type,
                                 hostname = null,
                                 addresses = setOf(address),
                                 ports = setOf(SSDP_PORT),
                                 services = setOf("UPnP / SSDP"),
                                 sources = setOf("UPnP"),
-                                manufacturer = null,
-                                deviceHint = classifySsdp(type, server),
-                                details = headers.filterKeys { it in SSDP_DETAIL_KEYS },
+                                manufacturer = identity?.manufacturer,
+                                deviceHint = identity?.modelName ?: identity?.modelDescription ?: classifySsdp(type, server),
+                                details = headers.filterKeys { it in SSDP_DETAIL_KEYS } + (identity?.asDetails().orEmpty()),
                                 lastSeenAt = System.currentTimeMillis()
                             )
                         )
@@ -415,11 +434,11 @@ class LanDiscoveryEngine(context: Context) {
     }
 
     private fun classifyPorts(ports: Set<Int>): String = when {
-        631 in ports || 9100 in ports -> "网络打印设备"
-        445 in ports -> "文件共享设备"
-        22 in ports -> "远程管理设备"
-        80 in ports || 443 in ports -> "提供 Web 管理或内容服务的设备"
-        else -> "响应常见网络服务的设备"
+        631 in ports && 9100 in ports -> "可能的打印设备（服务特征）"
+        445 in ports -> "可能的文件共享设备（服务特征）"
+        22 in ports -> "可能的远程管理设备（服务特征）"
+        80 in ports || 443 in ports -> "提供 Web 服务的设备（服务特征）"
+        else -> "响应常见网络服务的设备（服务特征）"
     }
 
     private class DeviceRegistry(private val publish: (LanDevice) -> Unit) {
@@ -463,7 +482,8 @@ data class LanNetworkSnapshot(
     val actualCidr: String,
     val scanCidr: String,
     val subnet: Ipv4Subnet,
-    val isHotspot: Boolean = false
+    val isHotspot: Boolean = false,
+    val hasVpn: Boolean = false
 )
 
 data class LanScanProgress(

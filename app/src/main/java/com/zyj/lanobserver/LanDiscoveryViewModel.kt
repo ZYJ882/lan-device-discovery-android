@@ -49,7 +49,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
             message = when {
                 snapshot == null -> "未检测到可用于局域网扫描的 IPv4 网络。请连接 Wi‑Fi 或以太网后重试。"
                 uiState.isScanning -> uiState.message
-                snapshot.isHotspot -> "已识别本机移动热点。扫描将只读取热点客户端公开广播与常见服务连通性。"
+                snapshot.isHotspot -> "已识别本机移动热点。为避免误报，扫描只采用客户端实际公开的 mDNS 与 UPnP 响应。"
                 else -> "已准备就绪。扫描只读取设备公开广播与常见服务连通性。"
             }
         )
@@ -69,12 +69,12 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
             isScanning = true,
             devices = emptyList(),
             selectedDeviceId = null,
-            progress = LanScanProgress("正在准备发现服务", 0, snapshot.subnet.scanHosts().size),
+            progress = LanScanProgress("正在准备发现服务", 0, if (snapshot.isHotspot || snapshot.hasVpn) 0 else snapshot.subnet.scanHosts().size),
             lastScanLabel = null,
             portScanStates = emptyMap(),
             onlineStates = emptyMap(),
             message = if (snapshot.isHotspot) {
-                "正在扫描热点子网 ${snapshot.scanCidr} 中设备公开的网络服务；未发现不代表设备未连接。"
+                "正在查找热点子网 ${snapshot.scanCidr} 中客户端实际公开的 mDNS 与 UPnP 服务；不会以裸 TCP 建连推断设备存在。"
             } else {
                 "正在扫描 ${snapshot.scanCidr}。不会发送登录请求、读取文件或执行远程命令。"
             }
@@ -94,7 +94,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
                     progress = null,
                     lastScanLabel = "上次扫描：$finishedLabel",
                     message = if (snapshot.isHotspot) {
-                        "热点扫描完成：在 ${summary.scannedHostCount} 个可检查地址中发现 ${summary.discoveredCount} 台响应设备。未显示不代表设备未连接。"
+                        "热点扫描完成：通过实际公开服务识别到 ${(summary.discoveredCount - 1).coerceAtLeast(0)} 台客户端。系统设置显示的已连接设备不一定都会公开服务。"
                     } else {
                         "扫描完成：在 ${summary.scannedHostCount} 个可检查地址中发现 ${summary.discoveredCount} 台设备。未响应不代表设备不存在。"
                     }
@@ -245,7 +245,8 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
         transport = transport,
         actualCidr = actualCidr,
         scanCidr = scanCidr,
-        isHotspot = isHotspot
+        isHotspot = isHotspot,
+        hasVpn = hasVpn
     )
 
     private companion object {
@@ -300,5 +301,6 @@ data class LanNetworkUi(
     val transport: String,
     val actualCidr: String,
     val scanCidr: String,
-    val isHotspot: Boolean = false
+    val isHotspot: Boolean = false,
+    val hasVpn: Boolean = false
 )

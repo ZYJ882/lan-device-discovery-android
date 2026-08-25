@@ -186,8 +186,21 @@ private fun NetworkOverviewCard(
                     Spacer(Modifier.height(5.dp))
                     Surface(color = LanSuccessBg, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
                         Text(
-                            "热点模式：扫描已接入设备公开的 mDNS、UPnP 与常见服务；未显示不代表设备未连接。",
+                                                        "热点模式：仅以客户端实际公开的 mDNS、UPnP 响应识别设备；不会以裸 TCP 建连推断设备存在。"
+,
                             color = LanSuccess,
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                        )
+                    }
+                }
+                if (network.hasVpn) {
+                    Spacer(Modifier.height(7.dp))
+                    Surface(color = Color(0xFFFFF4E5), shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            "检测到 VPN：已自动禁用 TCP 子网扫掠，避免代理或中间层导致虚假设备。",
+                            color = Color(0xFF9A6700),
                             fontSize = 12.sp,
                             lineHeight = 17.sp,
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
@@ -202,7 +215,9 @@ private fun NetworkOverviewCard(
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
                     Spacer(Modifier.height(7.dp))
                     Text(
-                        progress?.let { "${it.message} · ${it.completedHosts}/${it.totalHosts}" } ?: "正在扫描",
+                        progress?.let { item ->
+                            if (item.totalHosts > 0) "${item.message} · ${item.completedHosts}/${item.totalHosts}" else item.message
+                        } ?: "正在扫描",
                         color = LanMuted,
                         fontSize = 12.sp
                     )
