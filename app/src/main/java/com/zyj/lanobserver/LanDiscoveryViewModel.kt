@@ -4,6 +4,7 @@ import android.app.Application
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -39,7 +40,10 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
 
     init {
         refreshNetwork()
-        runCatching { connectivityManager.registerDefaultNetworkCallback(networkCallback) }
+        runCatching {
+            val request = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
+            connectivityManager.registerNetworkCallback(request, networkCallback)
+        }
     }
 
     fun refreshNetwork() {
@@ -83,7 +87,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
             try {
                 val summary = discoveryEngine.scan(
                     snapshot = snapshot,
-                    onDevice = { device -> publishDevice(device) },
+                    onDevicesChanged = { devices -> publishDevices(devices) },
                     onProgress = { progress ->
                         uiState = uiState.copy(progress = progress)
                     }
@@ -101,7 +105,11 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
                             else -> "热点扫描完成：系统限制了热点邻居缓存读取，公开服务识别到 $publicServiceCount 台。系统设置中的完整客户端列表仅系统应用可见。"
                         }
                     } else {
-                        "扫描完成：在 ${summary.scannedHostCount} 个可检查地址中发现 ${summary.discoveredCount} 台设备。未响应不代表设备不存在。"
+                        val arp = summary.diagnostics.sourceStats["ARP"]?.observations ?: 0
+                        val mdns = summary.diagnostics.sourceStats["mDNS"]?.observations ?: 0
+                        val ssdp = summary.diagnostics.sourceStats["SSDP"]?.observations ?: 0
+                        val tcp = summary.diagnostics.sourceStats["IP 服务探测"]?.observations ?: 0
+                        "扫描完成：多源原始证据 ARP $arp、mDNS $mdns、SSDP $ssdp、服务响应 $tcp；去重后 ${summary.discoveredCount} 台。${summary.scannedHostCount} 个 IPv4 地址仅用于补充服务证据，不代表完整设备数。"
                     }
                 )
             } catch (exception: SecurityException) {
@@ -233,11 +241,9 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
         uiState = uiState.copy(portScanStates = uiState.portScanStates + (deviceId to transform(current)))
     }
 
-    private fun publishDevice(device: LanDevice) {
-        val oldDevices = uiState.devices.associateBy { it.id }.toMutableMap()
-        oldDevices[device.id] = device
+    private fun publishDevices(devices: List<LanDevice>) {
         uiState = uiState.copy(
-            devices = oldDevices.values.sortedWith(
+            devices = devices.sortedWith(
                 compareByDescending<LanDevice> { it.id.startsWith("local:") }
                     .thenBy { it.displayName.lowercase(Locale.getDefault()) }
             )

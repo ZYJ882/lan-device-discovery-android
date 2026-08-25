@@ -1,5 +1,6 @@
 package com.zyj.lanobserver
 
+import android.net.Network
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.InetAddress
@@ -11,7 +12,7 @@ import java.nio.charset.StandardCharsets
  * 不探测任意路径、不提交打印任务、不跟随重定向，也不处理认证挑战。
  */
 class IppIdentityResolver {
-    fun resolve(host: InetAddress, port: Int, resourcePath: String?): IppPrinterIdentity? {
+    fun resolve(host: InetAddress, port: Int, resourcePath: String?, network: Network? = null): IppPrinterIdentity? {
         if (port !in 1..65535) return null
         val path = resourcePath.normalizedIppPath() ?: return null
         val hostAddress = host.hostAddress ?: return null
@@ -19,7 +20,8 @@ class IppIdentityResolver {
         val printerUri = "ipp://$hostForUrl:$port$path"
         val payload = createGetPrinterAttributes(printerUri)
         val body = runCatching {
-            val connection = (URL("http://$hostForUrl:$port$path").openConnection() as? HttpURLConnection) ?: return null
+            val endpoint = URL("http://$hostForUrl:$port$path")
+            val connection = ((network?.openConnection(endpoint) ?: endpoint.openConnection()) as? HttpURLConnection) ?: return null
             connection.instanceFollowRedirects = false
             connection.connectTimeout = CONNECT_TIMEOUT_MILLIS
             connection.readTimeout = READ_TIMEOUT_MILLIS

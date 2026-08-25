@@ -1,5 +1,6 @@
 package com.zyj.lanobserver
 
+import android.net.Network
 import org.w3c.dom.Document
 import java.io.ByteArrayInputStream
 import java.net.HttpURLConnection
@@ -8,30 +9,49 @@ import java.net.URL
 import javax.xml.parsers.DocumentBuilderFactory
 
 /**
- * 只读取 SSDP 响应设备自身公开的 UPnP 描述文档，用于补充友好名称、厂商与型号。
- *
- * 为防止将局域网发现变成任意 URL 请求：仅接受 http、响应地址相同的主机、固定大小与短超时。
+ * 仅读取 SSDP 响应设备自身、同一 IPv4 地址上的 UPnP device description。
+ * 请求使用扫描选定的 Wi‑Fi Network，禁止重定向、跨主机和超限读取。
  */
 class DeviceIdentityResolver {
-    fun resolveUpnpDescription(location: String, responderAddress: String): PublicDeviceIdentity? {
-        val url = runCatching { URL(location) }.getOrNull() ?: return null
-        if (url.protocol.lowercase() != "http") return null
+    fun resolveUpnpDescription(
+        location: String,
+        responderAddress: String,
+        network: Network?,
+        diagnostics: DiscoveryDiagnostics? = null
+    ): PublicDeviceIdentity? {
+        val url = runCatching { URL(location) }.getOrElse {
+            diagnostics?.sourceFailure("SSDP", "invalid LOCATION=$location")
+            return null
+        }
+        if (url.protocol.lowercase() != "http") {
+            diagnostics?.sourceFailure("SSDP", "unsupported LOCATION scheme=${url.protocol}")
+            return null
+        }
         val responderIp = runCatching { InetAddress.getByName(responderAddress).hostAddress }.getOrNull() ?: return null
-        val locationIp = runCatching { InetAddress.getByName(url.host).hostAddress }.getOrNull() ?: return null
-        if (responderIp != locationIp) return null
+        val locationIps = runCatching {
+            (network?.getAllByName(url.host) ?: InetAddress.getAllByName(url.host)).mapNotNull { it.hostAddress }.toSet()
+        }.getOrNull() ?: return null
+        if (responderIp !in locationIps) {
+            diagnostics?.sourceFailure("SSDP", "LOCATION host does not match responder ip=$responderIp host=${url.host}")
+            return null
+        }
 
         val payload = runCatching {
-            (url.openConnection() as? HttpURLConnection)?.let { connection ->
-                connection.instanceFollowRedirects = false
-                connection.connectTimeout = CONNECT_TIMEOUT_MILLIS
-                connection.readTimeout = READ_TIMEOUT_MILLIS
-                connection.requestMethod = "GET"
-                connection.setRequestProperty("User-Agent", "LanDeviceDiscovery/1.4")
-                connection.inputStream.use { input -> input.readBounded(MAX_DESCRIPTION_BYTES) }
-            }
-        }.getOrNull() ?: return null
+            val connection = ((network?.openConnection(url) ?: url.openConnection()) as? HttpURLConnection) ?: return null
+            connection.instanceFollowRedirects = false
+            connection.connectTimeout = CONNECT_TIMEOUT_MILLIS
+            connection.readTimeout = READ_TIMEOUT_MILLIS
+            connection.requestMethod = "GET"
+            connection.setRequestProperty("User-Agent", "LanDeviceDiscovery/2.0")
+            connection.inputStream.use { input -> input.readBounded(MAX_DESCRIPTION_BYTES) }
+        }.getOrElse {
+            diagnostics?.sourceFailure("SSDP", "UPnP description request failed ip=$responderAddress reason=${it.javaClass.simpleName}")
+            return null
+        }
         if (payload.isEmpty()) return null
-        return parsePublicIdentity(payload)
+        return parsePublicIdentity(payload)?.also { identity ->
+            diagnostics?.observation("SSDP", "upnpXml ip=$responderAddress name=${identity.friendlyName ?: "none"} model=${identity.modelName ?: "none"}")
+        }
     }
 
     private fun parsePublicIdentity(payload: ByteArray): PublicDeviceIdentity? = runCatching {
@@ -45,15 +65,16 @@ class DeviceIdentityResolver {
             runCatching { isExpandEntityReferences = false }
         }
         val document = factory.newDocumentBuilder().parse(ByteArrayInputStream(payload))
-        val identity = PublicDeviceIdentity(
+        PublicDeviceIdentity(
             friendlyName = document.textOf("friendlyName"),
             manufacturer = document.textOf("manufacturer"),
             modelName = document.textOf("modelName"),
             modelNumber = document.textOf("modelNumber"),
             modelDescription = document.textOf("modelDescription"),
+            serialNumber = document.textOf("serialNumber"),
+            udn = document.textOf("UDN"),
             deviceType = document.textOf("deviceType")
-        )
-        identity.takeIf { it.hasPublicIdentity }
+        ).takeIf { it.hasPublicIdentity }
     }.getOrNull()
 
     private fun Document.textOf(tagName: String): String? = getElementsByTagName(tagName)
@@ -76,10 +97,10 @@ class DeviceIdentityResolver {
     }
 
     private companion object {
-        const val CONNECT_TIMEOUT_MILLIS = 900
-        const val READ_TIMEOUT_MILLIS = 1_200
+        const val CONNECT_TIMEOUT_MILLIS = 1_200
+        const val READ_TIMEOUT_MILLIS = 1_500
         const val MAX_DESCRIPTION_BYTES = 64 * 1024
-        const val MAX_FIELD_LENGTH = 160
+        const val MAX_FIELD_LENGTH = 180
     }
 }
 
@@ -89,18 +110,28 @@ data class PublicDeviceIdentity(
     val modelName: String?,
     val modelNumber: String?,
     val modelDescription: String?,
+    val serialNumber: String?,
+    val udn: String?,
     val deviceType: String?
 ) {
     val hasPublicIdentity: Boolean
-        get() = listOf(friendlyName, manufacturer, modelName, modelNumber, modelDescription, deviceType).any { !it.isNullOrBlank() }
+        get() = listOf(friendlyName, manufacturer, modelName, modelNumber, modelDescription, serialNumber, udn, deviceType)
+            .any { !it.isNullOrBlank() }
+
+    fun bestFriendlyName(): String? = friendlyName?.takeIf { it.isNotBlank() }
+
+    fun bestModel(): String? = listOf(modelName, modelNumber, modelDescription)
+        .firstOrNull { !it.isNullOrBlank() }
 
     fun asDetails(): Map<String, String> = buildMap {
         put("型号识别证据", "UPnP 描述公开声明")
-        friendlyName?.let { put("UPnP 设备名", it) }
-        manufacturer?.let { put("公开厂商", it) }
+        friendlyName?.let { put("UPnP friendlyName", it) }
+        manufacturer?.let { put("UPnP 厂商", it) }
         modelName?.let { put("公开型号", it) }
-        modelNumber?.let { put("型号编号", it) }
-        modelDescription?.let { put("设备描述", it) }
-        deviceType?.let { put("UPnP 设备类型", it) }
+        modelNumber?.let { put("UPnP 型号编号", it) }
+        modelDescription?.let { put("UPnP 设备描述", it) }
+        serialNumber?.let { put("UPnP serialNumber", it) }
+        udn?.let { put("UPnP UDN", it) }
+        deviceType?.let { put("UPnP deviceType", it) }
     }
 }

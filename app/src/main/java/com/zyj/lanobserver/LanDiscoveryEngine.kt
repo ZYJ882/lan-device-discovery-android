@@ -3,19 +3,22 @@ package com.zyj.lanobserver
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.LinkProperties
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -29,374 +32,384 @@ import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.Socket
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 
 /**
- * 仅用于当前活动局域网的只读设备发现。
+ * 只读、多发现源的局域网设备发现引擎。
  *
- * 设备结果来自三类公开可见信号：DNS-SD/mDNS 服务公告、UPnP/SSDP 响应，以及少量常见
- * 服务端口的 TCP 建连成功。该类不会尝试登录设备、读取文件、执行命令或探测漏洞。
+ * 发现结果不是“子网地址扫描数量”，而是 ARP/邻居、mDNS、SSDP/UPnP 和既有服务探测
+ * 等独立证据的合并。所有可控的网络请求均绑定到明确选择的 Wi‑Fi Network。
  */
 class LanDiscoveryEngine(context: Context) {
     private val appContext = context.applicationContext
     private val connectivityManager = appContext.getSystemService(ConnectivityManager::class.java)
     private val nsdManager = appContext.getSystemService(NsdManager::class.java)
-    private val wifiManager = appContext.applicationContext.getSystemService(WifiManager::class.java)
+    private val wifiManager = appContext.getSystemService(WifiManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val callbackExecutor = Executor { command -> mainHandler.post(command) }
     private val identityResolver = DeviceIdentityResolver()
     private val ippIdentityResolver = IppIdentityResolver()
-    private val upnpIdentityCache = ConcurrentHashMap<String, PublicDeviceIdentity>()
 
-    /**
-     * 优先返回本机移动热点的下游接口；热点未开启时，返回应用的活动局域网接口。
-     *
-     * 普通应用不能可靠读取系统 DHCP 客户端表，因此热点客户端仍通过其公开服务响应来发现。
-     */
+    /** 明确选择实际承载 IPv4 的 Wi‑Fi Network，不将 VPN 作为扫描目标。 */
     fun networkSnapshot(): LanNetworkSnapshot? {
-        val activeNetwork = connectivityManager.activeNetwork
-        val activeProperties = activeNetwork?.let { connectivityManager.getLinkProperties(it) }
-        val activeCapabilities = activeNetwork?.let { connectivityManager.getNetworkCapabilities(it) }
-        val activeSnapshot = activeProperties?.let { properties ->
-            val localAddress = properties.linkAddresses
-                .firstOrNull { address -> address.address is Inet4Address && !address.address.isLoopbackAddress }
-                ?: return@let null
-            val address = localAddress.address as Inet4Address
-            val subnet = Ipv4Subnet.from(address, localAddress.prefixLength)
-            val gateway = properties.routes
-                .firstOrNull { route -> route.destination.prefixLength == 0 && route.gateway is Inet4Address }
-                ?.gateway
-                ?.hostAddress
-            LanNetworkSnapshot(
-                localIp = address.hostAddress.orEmpty(),
-                gateway = gateway,
-                interfaceName = properties.interfaceName.orEmpty(),
-                transport = when {
-                    activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> "Wi‑Fi"
-                    activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true -> "以太网"
-                    activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true -> "VPN"
-                    else -> "当前网络"
-                },
-                actualCidr = subnet.cidrLabel,
-                scanCidr = subnet.scanCidrLabel,
-                subnet = subnet,
-                isHotspot = false,
-                hasVpn = activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
-            )
+        val allNetworks = connectivityManager.allNetworks.toList()
+        val vpnPresent = allNetworks.any { network ->
+            connectivityManager.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
         }
-        return hotspotSnapshot(activeSnapshot, activeCapabilities) ?: activeSnapshot
+        val wifiSnapshots = allNetworks.mapNotNull { network ->
+            val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return@mapNotNull null
+            if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return@mapNotNull null
+            val properties = connectivityManager.getLinkProperties(network) ?: return@mapNotNull null
+            snapshotFromWifi(network, properties, vpnPresent, capabilities)
+        }
+        return wifiSnapshots.maxByOrNull { snapshot ->
+            val caps = snapshot.network?.let(connectivityManager::getNetworkCapabilities)
+            when {
+                caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true -> 3
+                caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true -> 2
+                else -> 1
+            }
+        } ?: hotspotSnapshot(vpnPresent)
     }
 
-    private fun hotspotSnapshot(
-        activeSnapshot: LanNetworkSnapshot?,
-        activeCapabilities: NetworkCapabilities?
+    private fun snapshotFromWifi(
+        network: Network,
+        properties: LinkProperties,
+        vpnPresent: Boolean,
+        capabilities: NetworkCapabilities
     ): LanNetworkSnapshot? {
+        val linkAddress = properties.linkAddresses.firstOrNull { address ->
+            address.address is Inet4Address && !address.address.isLoopbackAddress
+        } ?: return null
+        val address = linkAddress.address as Inet4Address
+        val subnet = Ipv4Subnet.from(address, linkAddress.prefixLength)
+        val gateway = properties.routes
+            .firstOrNull { route -> route.destination.prefixLength == 0 && route.gateway is Inet4Address }
+            ?.gateway
+            ?.hostAddress
+        return LanNetworkSnapshot(
+            network = network,
+            localIp = address.hostAddress.orEmpty(),
+            gateway = gateway,
+            interfaceName = properties.interfaceName.orEmpty(),
+            transport = if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) "Wi‑Fi" else "本地 Wi‑Fi",
+            actualCidr = subnet.cidrLabel,
+            scanCidr = subnet.scanCidrLabel,
+            subnet = subnet,
+            isHotspot = false,
+            hasVpn = vpnPresent
+        )
+    }
+
+    /** 仅在未能获取 Wi‑Fi Network 时尝试识别本机热点下游接口；热点没有公开的 Network 句柄。 */
+    private fun hotspotSnapshot(vpnPresent: Boolean): LanNetworkSnapshot? {
         val interfaces = runCatching { NetworkInterface.getNetworkInterfaces() }.getOrNull() ?: return null
-        val activeIsCellular = activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
-        var bestCandidate: HotspotInterfaceCandidate? = null
+        var candidate: HotspotInterfaceCandidate? = null
         while (interfaces.hasMoreElements()) {
             val networkInterface = interfaces.nextElement()
             if (!runCatching { networkInterface.isUp && !networkInterface.isLoopback }.getOrDefault(false)) continue
             val name = networkInterface.name.orEmpty().lowercase()
+            if (!(name.contains("softap") || name.startsWith("ap") || name.contains("tether"))) continue
             val address = networkInterface.interfaceAddresses
                 .firstOrNull { item -> item.address is Inet4Address && item.address.isSiteLocalAddress }
                 ?: continue
-            val score = hotspotCandidateScore(name, activeSnapshot?.interfaceName, activeIsCellular)
-            if (score <= 0) continue
-            val candidate = HotspotInterfaceCandidate(networkInterface.name, address.address as Inet4Address, address.networkPrefixLength, score)
-            if (bestCandidate == null || candidate.score > bestCandidate.score) bestCandidate = candidate
+            candidate = HotspotInterfaceCandidate(networkInterface.name, address.address as Inet4Address, address.networkPrefixLength)
+            break
         }
-        val candidate = bestCandidate ?: return null
-        val subnet = Ipv4Subnet.from(candidate.address, candidate.prefixLength.toInt())
+        val selected = candidate ?: return null
+        val subnet = Ipv4Subnet.from(selected.address, selected.prefixLength.toInt())
         return LanNetworkSnapshot(
-            localIp = candidate.address.hostAddress.orEmpty(),
-            gateway = candidate.address.hostAddress,
-            interfaceName = candidate.interfaceName,
+            network = null,
+            localIp = selected.address.hostAddress.orEmpty(),
+            gateway = selected.address.hostAddress,
+            interfaceName = selected.interfaceName,
             transport = "移动热点",
             actualCidr = subnet.cidrLabel,
             scanCidr = subnet.scanCidrLabel,
             subnet = subnet,
             isHotspot = true,
-            hasVpn = activeCapabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+            hasVpn = vpnPresent
         )
     }
-
-    private fun hotspotCandidateScore(
-        interfaceName: String,
-        activeInterfaceName: String?,
-        activeIsCellular: Boolean
-    ): Int = when {
-        interfaceName.contains("softap") || interfaceName.startsWith("ap") || interfaceName.contains("tether") -> 100
-        activeIsCellular && (interfaceName.startsWith("wlan") || interfaceName.startsWith("wifi")) -> 80
-        activeIsCellular && interfaceName != activeInterfaceName?.lowercase() -> 60
-        else -> 0
-    }
-
-    private data class HotspotInterfaceCandidate(
-        val interfaceName: String,
-        val address: Inet4Address,
-        val prefixLength: Short,
-        val score: Int
-    )
 
     suspend fun scan(
         snapshot: LanNetworkSnapshot,
-        onDevice: (LanDevice) -> Unit,
+        onDevicesChanged: (List<LanDevice>) -> Unit,
         onProgress: (LanScanProgress) -> Unit
     ): LanScanSummary = coroutineScope {
         val startedAt = System.currentTimeMillis()
-        val registry = DeviceRegistry(onDevice)
-        registry.upsert(
-            LanDevice(
-                id = "local:${snapshot.localIp}",
-                displayName = if (snapshot.isHotspot) "本机热点" else "本机",
-                hostname = null,
-                addresses = setOf(snapshot.localIp),
-                ports = emptySet(),
-                services = setOf(if (snapshot.isHotspot) "热点网关" else "本机"),
-                sources = setOf(if (snapshot.isHotspot) "本机热点网络信息" else "本机网络信息"),
-                manufacturer = null,
-                deviceHint = "Android 设备",
-                details = mapOf(
-                    "网络接口" to snapshot.interfaceName,
-                    "网络模式" to if (snapshot.isHotspot) "移动热点" else snapshot.transport
-                ),
-                lastSeenAt = startedAt
-            )
-        )
+        val diagnostics = DiscoveryDiagnostics(snapshot)
+        diagnostics.scanStarted()
+        val registry = DeviceRegistry({ devices -> mainHandler.post { onDevicesChanged(devices) } }, diagnostics)
+        registry.upsert(localDevice(snapshot, startedAt))
 
-        // 热点下游流量可能被系统或 VPN 中间层处理。对整个子网做裸 TCP connect 会把
-        // 中间层接受的连接误判为目标设备开放端口，因此热点和 VPN 场景只采用真实广播响应。
-        val canSweepTcp = !snapshot.isHotspot && !snapshot.hasVpn
-        val tcpHostCount = if (canSweepTcp) snapshot.subnet.scanHosts().size else 0
-        val hotspotNeighbors = if (snapshot.isHotspot) readHotspotNeighbors(snapshot) else HotspotNeighborRead.unavailable()
-        hotspotNeighbors.devices.forEach { neighbor -> registry.upsert(neighbor.toLanDevice(startedAt)) }
+        val neighborRead = readNeighbors(snapshot, diagnostics)
+        neighborRead.entries.forEach { registry.upsert(it.toLanDevice(startedAt)) }
+
         val multicastLock = acquireMulticastLock()
+        diagnostics.multicastLock(multicastLock?.isHeld == true)
+        val canSweepTcp = !snapshot.isHotspot && !snapshot.hasVpn && snapshot.network != null
+        val hostCount = if (canSweepTcp) snapshot.subnet.scanHosts().size else 0
         try {
             onProgress(
                 LanScanProgress(
-                    when {
-                        snapshot.isHotspot -> "正在查找热点客户端公开的 mDNS 与 UPnP 服务"
-                        snapshot.hasVpn -> "检测到 VPN，已跳过 TCP 子网扫掠以避免误报"
-                        else -> "正在查找 mDNS、UPnP 及常见网络服务"
-                    },
-                    0,
-                    tcpHostCount
+                    message = "正在通过 ARP、mDNS、SSDP 与已有服务证据发现当前 Wi‑Fi 设备",
+                    completedHosts = 0,
+                    totalHosts = hostCount
                 )
             )
-            val mdns = async(Dispatchers.IO) {
-                discoverMdns(registry)
-            }
-            val ssdp = async(Dispatchers.IO) {
-                discoverSsdp(registry)
-            }
+            val mdns = async(Dispatchers.IO) { discoverMdns(snapshot, registry, diagnostics, this@coroutineScope) }
+            val ssdp = async(Dispatchers.IO) { discoverSsdp(snapshot, registry, diagnostics) }
             val tcp = async(Dispatchers.IO) {
-                if (canSweepTcp) probeCommonServices(snapshot, registry, onProgress)
+                if (canSweepTcp) probeExistingServices(snapshot, registry, diagnostics, onProgress)
             }
             awaitAll(mdns, ssdp, tcp)
+            val finalDevices = registry.snapshot()
+            val finalDiagnostics = diagnostics.finish(
+                rawObservations = registry.rawObservationCount(),
+                deduplicatedDevices = finalDevices.size,
+                scannedHosts = hostCount
+            )
             LanScanSummary(
                 startedAt = startedAt,
                 finishedAt = System.currentTimeMillis(),
-                discoveredCount = registry.snapshot().size,
-                scannedHostCount = tcpHostCount,
-                hotspotNeighborCount = hotspotNeighbors.devices.size,
-                hotspotNeighborCacheReadable = hotspotNeighbors.cacheReadable
+                discoveredCount = finalDevices.size,
+                scannedHostCount = hostCount,
+                hotspotNeighborCount = if (snapshot.isHotspot) neighborRead.entries.size else 0,
+                hotspotNeighborCacheReadable = neighborRead.cacheReadable,
+                diagnostics = finalDiagnostics
             )
         } finally {
             multicastLock?.let { lock -> if (lock.isHeld) lock.release() }
         }
     }
 
-    /**
-     * 在部分设备上，普通应用仍可只读访问 Linux 邻居缓存。该缓存只反映近期有 L2/L3 通信的
-     * 对端，不能等同于系统热点的完整关联客户端表；若平台限制读取，返回不可用而非猜测。
-     */
-    private fun readHotspotNeighbors(snapshot: LanNetworkSnapshot): HotspotNeighborRead {
-        val arpFile = File("/proc/net/arp")
-        if (!arpFile.canRead()) return HotspotNeighborRead.unavailable()
-        return runCatching {
-            val neighbors = arpFile.useLines { lines ->
-                lines.drop(1).mapNotNull { line ->
-                    val columns = line.trim().split(Regex("\\s+"))
-                    if (columns.size < 6) return@mapNotNull null
-                    val ip = runCatching { InetAddress.getByName(columns[0]) as? Inet4Address }.getOrNull() ?: return@mapNotNull null
-                    val flags = columns[2]
-                    val mac = columns[3]
-                    val networkInterface = columns[5]
-                    if (
-                        flags != "0x2" ||
-                        mac.equals("00:00:00:00:00:00", ignoreCase = true) ||
-                        ip.hostAddress == snapshot.localIp ||
-                        !snapshot.subnet.contains(ip)
-                    ) return@mapNotNull null
-                    HotspotNeighbor(
-                        ipAddress = ip.hostAddress.orEmpty(),
-                        maskedMac = mac.maskedMac(),
-                        networkInterface = networkInterface
-                    )
-                }.toList()
-            }
-            HotspotNeighborRead(cacheReadable = true, devices = neighbors)
-        }.getOrElse { HotspotNeighborRead.unavailable() }
-    }
+    private fun localDevice(snapshot: LanNetworkSnapshot, timestamp: Long) = LanDevice(
+        id = "local:${snapshot.localIp}",
+        displayName = if (snapshot.isHotspot) "本机热点" else "本机",
+        hostname = null,
+        addresses = setOf(snapshot.localIp),
+        ports = emptySet(),
+        services = setOf(if (snapshot.isHotspot) "热点网关" else "本机网络"),
+        sources = setOf("本机网络信息"),
+        manufacturer = null,
+        deviceHint = "Android 设备",
+        details = mapOf(
+            "网络接口" to snapshot.interfaceName,
+            "网络模式" to snapshot.transport,
+            "名称来源" to "本机网络信息"
+        ),
+        lastSeenAt = timestamp
+    )
 
-    private fun String.maskedMac(): String = split(':').let { pieces ->
-        if (pieces.size == 6) "${pieces[0]}:${pieces[1]}:${pieces[2]}:••:••:${pieces[5]}" else "已掩码"
+    /** 只读当前接口的 ARP 邻居缓存。受平台限制时记录失败，不伪造设备。 */
+    private fun readNeighbors(snapshot: LanNetworkSnapshot, diagnostics: DiscoveryDiagnostics): NeighborRead {
+        val arp = File("/proc/net/arp")
+        if (!arp.canRead()) {
+            diagnostics.neighborCache(false, 0)
+            return NeighborRead(false, emptyList())
+        }
+        return runCatching {
+            val entries = arp.useLines { lines ->
+                lines.drop(1).mapNotNull { line ->
+                    val values = line.trim().split(Regex("\\s+"))
+                    if (values.size < 6 || values[2] != "0x2") return@mapNotNull null
+                    val ip = runCatching { InetAddress.getByName(values[0]) as? Inet4Address }.getOrNull() ?: return@mapNotNull null
+                    val mac = values[3].takeUnless { it.equals("00:00:00:00:00:00", ignoreCase = true) } ?: return@mapNotNull null
+                    val interfaceName = values[5]
+                    val correctInterface = interfaceName == snapshot.interfaceName || (snapshot.isHotspot && snapshot.subnet.contains(ip))
+                    if (!correctInterface || ip.hostAddress == snapshot.localIp || !snapshot.subnet.contains(ip)) return@mapNotNull null
+                    NeighborEntry(ip.hostAddress.orEmpty(), mac.lowercase(), interfaceName)
+                }.distinctBy { it.ipAddress }.toList()
+            }
+            diagnostics.neighborCache(true, entries.size)
+            NeighborRead(true, entries)
+        }.getOrElse {
+            diagnostics.neighborCache(false, 0)
+            NeighborRead(false, emptyList())
+        }
     }
 
     private fun acquireMulticastLock(): WifiManager.MulticastLock? = runCatching {
-        wifiManager?.createMulticastLock("lan-device-discovery").also { lock ->
-            lock?.setReferenceCounted(false)
-            lock?.acquire()
+        wifiManager.createMulticastLock("lan-device-discovery").also { lock ->
+            lock.setReferenceCounted(false)
+            lock.acquire()
         }
     }.getOrNull()
 
-    private suspend fun discoverMdns(registry: DeviceRegistry) {
-        // 采用常见、公开的 DNS-SD 服务类型；只处理设备自己广播出的元数据。
-        val serviceTypes = listOf(
-            "_http._tcp.",
-            "_https._tcp.",
-            "_ipp._tcp.",
-            "_printer._tcp.",
-            "_airplay._tcp.",
-            "_googlecast._tcp.",
-            "_ssh._tcp.",
-            "_smb._tcp."
-        )
-        serviceTypes.forEach { serviceType ->
-            if (kotlinx.coroutines.currentCoroutineContext().isActive) {
-                discoverOneServiceType(serviceType, registry)
+    private suspend fun discoverMdns(
+        snapshot: LanNetworkSnapshot,
+        registry: DeviceRegistry,
+        diagnostics: DiscoveryDiagnostics,
+        scanScope: CoroutineScope
+    ) = coroutineScope {
+        val types = MDNS_SERVICE_TYPES
+        val semaphore = Semaphore(MDNS_PARALLEL_DISCOVERIES)
+        types.map { type ->
+            async {
+                semaphore.withPermit { discoverOneServiceType(type, snapshot.network, registry, diagnostics, scanScope) }
             }
-        }
+        }.awaitAll()
     }
 
-    private suspend fun discoverOneServiceType(serviceType: String, registry: DeviceRegistry) {
+    private suspend fun discoverOneServiceType(
+        serviceType: String,
+        network: Network?,
+        registry: DeviceRegistry,
+        diagnostics: DiscoveryDiagnostics,
+        scanScope: CoroutineScope
+    ) {
+        diagnostics.sourceStarted("mDNS")
         suspendCancellableCoroutine { continuation ->
             var started = false
             var stopRequested = false
             lateinit var listener: NsdManager.DiscoveryListener
-
+            fun finish() {
+                if (continuation.isActive) continuation.resume(Unit)
+            }
             fun requestStop() {
                 if (stopRequested) return
                 stopRequested = true
-                if (started) {
-                    runCatching { nsdManager.stopServiceDiscovery(listener) }
-                } else if (continuation.isActive) {
-                    continuation.resume(Unit)
-                }
+                if (started) runCatching { nsdManager.stopServiceDiscovery(listener) }.onFailure { finish() } else finish()
             }
-
             listener = object : NsdManager.DiscoveryListener {
                 override fun onDiscoveryStarted(regType: String) {
                     started = true
                     mainHandler.postDelayed({ requestStop() }, MDNS_WINDOW_MILLIS)
                 }
-
                 override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-                    resolveMdnsService(serviceInfo, registry)
+                    diagnostics.sourceResponse("mDNS", "type=$serviceType instance=${serviceInfo.serviceName}")
+                    resolveMdnsService(serviceInfo, registry, diagnostics, scanScope, network)
                 }
-
                 override fun onServiceLost(serviceInfo: NsdServiceInfo) = Unit
-
-                override fun onDiscoveryStopped(serviceType: String) {
-                    if (continuation.isActive) continuation.resume(Unit)
+                override fun onDiscoveryStopped(type: String) = finish()
+                override fun onStartDiscoveryFailed(type: String, errorCode: Int) {
+                    diagnostics.sourceFailure("mDNS", "start type=$type code=$errorCode")
+                    finish()
                 }
-
-                override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
-                    if (continuation.isActive) continuation.resume(Unit)
-                }
-
-                override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
-                    if (continuation.isActive) continuation.resume(Unit)
+                override fun onStopDiscoveryFailed(type: String, errorCode: Int) {
+                    diagnostics.sourceFailure("mDNS", "stop type=$type code=$errorCode")
+                    finish()
                 }
             }
-
             continuation.invokeOnCancellation {
-                mainHandler.removeCallbacksAndMessages(null)
                 if (started) runCatching { nsdManager.stopServiceDiscovery(listener) }
             }
             runCatching {
-                nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, listener)
-            }.onFailure { if (continuation.isActive) continuation.resume(Unit) }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && network != null) {
+                    nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, network, callbackExecutor, listener)
+                } else {
+                    nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, listener)
+                }
+            }.onFailure {
+                diagnostics.sourceFailure("mDNS", "request type=$serviceType reason=${it.javaClass.simpleName}")
+                finish()
+            }
         }
     }
 
-    private fun resolveMdnsService(service: NsdServiceInfo, registry: DeviceRegistry) {
+    private fun resolveMdnsService(
+        service: NsdServiceInfo,
+        registry: DeviceRegistry,
+        diagnostics: DiscoveryDiagnostics,
+        scanScope: CoroutineScope,
+        network: Network?
+    ) {
         runCatching {
             nsdManager.resolveService(service, object : NsdManager.ResolveListener {
-                override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) = Unit
-
+                override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                    diagnostics.sourceFailure("mDNS", "resolve instance=${serviceInfo.serviceName} code=$errorCode")
+                }
                 override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
                     val host = serviceInfo.host
                     val address = host?.hostAddress
                     val attributes = serviceInfo.attributes
                         .mapValues { (_, value) -> value.toString(StandardCharsets.UTF_8) }
                         .filterValues { it.isNotBlank() }
-                    val serviceLabel = serviceInfo.serviceType.removePrefix("_").removeSuffix("._tcp.")
+                    val label = serviceLabel(serviceInfo.serviceType)
                     val publicIdentity = MdnsIdentityNormalizer.normalize(attributes, serviceInfo.serviceName)
+                    val hostname = host?.hostName?.removeSuffix(".local.")?.removeSuffix(".local")?.takeIf { it.isNotBlank() }
+                    val model = publicIdentity.model
+                    val manufacturerModel = listOfNotNull(publicIdentity.manufacturer, model).joinToString(" ").takeIf { it.isNotBlank() }
+                    val displayName = hostname ?: publicIdentity.friendlyName ?: manufacturerModel ?: "未知设备"
+                    val nameSource = when {
+                        hostname != null -> "mDNS hostname"
+                        publicIdentity.friendlyName != null -> "mDNS 服务名称"
+                        manufacturerModel != null -> "mDNS 厂商与型号"
+                        else -> "未知"
+                    }
                     registry.upsert(
                         LanDevice(
-                            id = address?.let { "ip:$it" } ?: "mdns:${serviceInfo.serviceName}:${serviceInfo.serviceType}",
-                            displayName = publicIdentity.friendlyName ?: serviceInfo.serviceName,
-                            hostname = host?.hostName,
+                            id = "mdns:${serviceInfo.serviceName}:${serviceInfo.serviceType}",
+                            displayName = displayName,
+                            hostname = hostname,
                             addresses = address?.let { setOf(it) } ?: emptySet(),
                             ports = serviceInfo.port.takeIf { it > 0 }?.let { setOf(it) } ?: emptySet(),
-                            services = setOf(serviceLabel),
-                            sources = setOf("mDNS"),
+                            services = setOf(label),
+                            sources = setOf("mDNS / DNS-SD"),
                             manufacturer = publicIdentity.manufacturer,
-                            deviceHint = publicIdentity.model ?: classifyService(serviceLabel),
-                            details = attributes + mapOf("服务实例" to serviceInfo.serviceName) + publicIdentity.asDetails(),
+                            deviceHint = model ?: classifyService(label),
+                            details = attributes + publicIdentity.asDetails() + mapOf(
+                                "mDNS 服务" to label,
+                                "mDNS 服务实例" to serviceInfo.serviceName,
+                                "mDNS 服务类型" to serviceInfo.serviceType,
+                                "名称来源" to nameSource
+                            ),
                             lastSeenAt = System.currentTimeMillis()
                         )
                     )
-                    if (serviceLabel == "ipp" && host != null && serviceInfo.port > 0 && address != null) {
-                        val ippResourcePath = attributes.entries.firstOrNull { (key, _) -> key.equals("rp", ignoreCase = true) }?.value
-                        resolveIppIdentityAsync(host, serviceInfo.port, ippResourcePath, address, serviceInfo.serviceName, registry)
+                    diagnostics.observation("mDNS", "ip=${address ?: "none"} hostname=${hostname ?: "none"} service=$label")
+                    if (label == "IPP" && host != null && serviceInfo.port > 0 && address != null) {
+                        val resourcePath = attributes.entries.firstOrNull { (key, _) -> key.equals("rp", true) }?.value
+                        scanScope.launch(Dispatchers.IO) {
+                            resolveIppIdentity(host, serviceInfo.port, resourcePath, address, serviceInfo.serviceName, network, registry, diagnostics)
+                        }
                     }
                 }
             })
-        }
+        }.onFailure { diagnostics.sourceFailure("mDNS", "resolve request reason=${it.javaClass.simpleName}") }
     }
 
-    private fun resolveIppIdentityAsync(
+    private fun resolveIppIdentity(
         host: InetAddress,
         port: Int,
         resourcePath: String?,
         address: String,
         fallbackName: String,
-        registry: DeviceRegistry
+        network: Network?,
+        registry: DeviceRegistry,
+        diagnostics: DiscoveryDiagnostics
     ) {
-        Thread({
-            val identity = ippIdentityResolver.resolve(host, port, resourcePath) ?: return@Thread
-            registry.upsert(
-                LanDevice(
-                    id = "ip:$address",
-                    displayName = identity.name ?: identity.makeAndModel ?: fallbackName,
-                    hostname = host.hostName,
-                    addresses = setOf(address),
-                    ports = setOf(port),
-                    services = setOf("IPP"),
-                    sources = setOf("IPP 标准属性"),
-                    manufacturer = null,
-                    deviceHint = identity.makeAndModel ?: "网络打印设备",
-                    details = identity.asDetails(),
-                    lastSeenAt = System.currentTimeMillis()
-                )
+        val identity = ippIdentityResolver.resolve(host, port, resourcePath, network) ?: return
+        registry.upsert(
+            LanDevice(
+                id = "ip:$address",
+                displayName = identity.name ?: identity.makeAndModel ?: fallbackName,
+                hostname = host.hostName?.removeSuffix(".local."),
+                addresses = setOf(address),
+                ports = setOf(port),
+                services = setOf("IPP"),
+                sources = setOf("IPP 标准属性"),
+                manufacturer = null,
+                deviceHint = identity.makeAndModel ?: "网络打印设备",
+                details = identity.asDetails() + mapOf("名称来源" to "IPP 打印机名称"),
+                lastSeenAt = System.currentTimeMillis()
             )
-        }, "ipp-identity").start()
+        )
+        diagnostics.observation("IPP", "ip=$address model=${identity.makeAndModel ?: "none"}")
     }
 
-    private suspend fun discoverSsdp(registry: DeviceRegistry) = withContext(Dispatchers.IO) {
-        val request = (
-            "M-SEARCH * HTTP/1.1\r\n" +
-                "HOST: 239.255.255.250:1900\r\n" +
-                "MAN: \"ssdp:discover\"\r\n" +
-                "MX: 2\r\n" +
-                "ST: ssdp:all\r\n\r\n"
-            ).toByteArray(StandardCharsets.UTF_8)
+    private suspend fun discoverSsdp(snapshot: LanNetworkSnapshot, registry: DeviceRegistry, diagnostics: DiscoveryDiagnostics) = withContext(Dispatchers.IO) {
+        diagnostics.sourceStarted("SSDP")
+        val request = SSDP_REQUEST.toByteArray(StandardCharsets.UTF_8)
         runCatching {
-            DatagramSocket().use { socket ->
-                socket.soTimeout = 800
+            DatagramSocket(null).use { socket ->
+                socket.reuseAddress = true
+                socket.bind(InetSocketAddress(0))
+                snapshot.network?.bindSocket(socket)
+                socket.soTimeout = SSDP_RECEIVE_TIMEOUT_MILLIS
                 socket.send(DatagramPacket(request, request.size, InetAddress.getByName(SSDP_ADDRESS), SSDP_PORT))
                 val deadline = System.currentTimeMillis() + SSDP_WINDOW_MILLIS
                 while (System.currentTimeMillis() < deadline && kotlinx.coroutines.currentCoroutineContext().isActive) {
@@ -406,77 +419,101 @@ class LanDiscoveryEngine(context: Context) {
                         socket.receive(response)
                         val headers = parseHeaders(String(response.data, 0, response.length, StandardCharsets.UTF_8))
                         val address = response.address.hostAddress.orEmpty()
-                        val server = headers["server"]
-                        val type = headers["st"] ?: headers["nt"] ?: "UPnP 设备"
+                        diagnostics.sourceResponse("SSDP", "ip=$address usn=${headers["usn"] ?: "none"} st=${headers["st"] ?: "none"}")
+                        if (address.isBlank()) continue
                         val location = headers["location"]
-                        val cacheKey = "$address|${location.orEmpty()}"
-                        val identity = location?.let { publicLocation ->
-                            upnpIdentityCache[cacheKey] ?: identityResolver
-                                .resolveUpnpDescription(publicLocation, address)
-                                ?.also { resolved -> upnpIdentityCache[cacheKey] = resolved }
+                        val identity = location?.let { identityResolver.resolveUpnpDescription(it, address, snapshot.network, diagnostics) }
+                        val type = headers["st"] ?: headers["nt"] ?: "UPnP 设备"
+                        val displayName = upnpDisplayName(identity)
+                        val aliases = buildMap {
+                            headers["usn"]?.let { put("SSDP USN", it) }
+                            headers["server"]?.let { put("SSDP SERVER", it) }
+                            headers["st"]?.let { put("SSDP ST", it) }
+                            headers["cache-control"]?.let { put("SSDP CACHE-CONTROL", it) }
+                            headers["location"]?.let { put("SSDP LOCATION", it) }
                         }
                         registry.upsert(
                             LanDevice(
-                                id = "ip:$address",
-                                displayName = identity?.friendlyName ?: identity?.modelName ?: server ?: type,
+                                id = "ssdp:${headers["usn"] ?: address}",
+                                displayName = displayName.first,
                                 hostname = null,
                                 addresses = setOf(address),
                                 ports = setOf(SSDP_PORT),
                                 services = setOf("UPnP / SSDP"),
-                                sources = setOf("UPnP"),
+                                sources = setOf("SSDP / UPnP"),
                                 manufacturer = identity?.manufacturer,
-                                deviceHint = identity?.modelName ?: identity?.modelDescription ?: classifySsdp(type, server),
-                                details = headers.filterKeys { it in SSDP_DETAIL_KEYS } + (identity?.asDetails().orEmpty()),
+                                deviceHint = identity?.bestModel() ?: classifySsdp(type),
+                                details = aliases + (identity?.asDetails().orEmpty()) + mapOf(
+                                    "名称来源" to displayName.second,
+                                    "UPnP 设备类型" to (identity?.deviceType ?: type)
+                                ),
                                 lastSeenAt = System.currentTimeMillis()
                             )
                         )
+                        diagnostics.observation("SSDP", "ip=$address name=${displayName.first} type=$type")
                     } catch (_: java.net.SocketTimeoutException) {
-                        // 到达短超时后继续等待，直至 SSDP 窗口结束。
+                        // 在完整监听窗口内持续接收；短超时仅用于检查取消条件。
                     }
                 }
             }
-        }
+        }.onFailure { diagnostics.sourceFailure("SSDP", "request reason=${it.javaClass.simpleName}") }
     }
 
-    private suspend fun probeCommonServices(
+    /** 保证 SERVER 只保留为详情字段，绝不作为用户可见名称。 */
+    private fun upnpDisplayName(identity: PublicDeviceIdentity?): Pair<String, String> {
+        identity?.bestFriendlyName()?.let { return it to "UPnP friendlyName" }
+        val manufacturerModel = listOfNotNull(identity?.manufacturer, identity?.modelName).joinToString(" ").takeIf { it.isNotBlank() }
+        if (manufacturerModel != null) return manufacturerModel to "UPnP 厂商与型号"
+        val manufacturerType = listOfNotNull(identity?.manufacturer, identity?.deviceType).joinToString(" ").takeIf { it.isNotBlank() }
+        if (manufacturerType != null) return manufacturerType to "UPnP 厂商与设备类型"
+        return "未知设备" to "未知"
+    }
+
+    /** 固定的小型既有服务集，仅作低置信度补充，不扩大端口范围。 */
+    private suspend fun probeExistingServices(
         snapshot: LanNetworkSnapshot,
         registry: DeviceRegistry,
+        diagnostics: DiscoveryDiagnostics,
         onProgress: (LanScanProgress) -> Unit
     ) = coroutineScope {
+        diagnostics.sourceStarted("IP 服务探测")
         val hosts = snapshot.subnet.scanHosts().filter { it.hostAddress != snapshot.localIp }
         val semaphore = Semaphore(TCP_CONCURRENCY)
         hosts.mapIndexed { index, address ->
             async(Dispatchers.IO) {
                 semaphore.withPermit {
-                    val openPorts = COMMON_TCP_SERVICES.filter { service ->
-                        isTcpPortOpen(address, service.port)
-                    }
-                    if (openPorts.isNotEmpty()) {
+                    val responsive = EXISTING_TCP_SERVICES.filter { service -> isTcpPortOpen(snapshot.network, address, service.port) }
+                    if (responsive.isNotEmpty()) {
                         val ip = address.hostAddress.orEmpty()
                         registry.upsert(
                             LanDevice(
                                 id = "ip:$ip",
-                                displayName = "设备 · $ip",
+                                displayName = "未知设备",
                                 hostname = null,
                                 addresses = setOf(ip),
-                                ports = openPorts.map { it.port }.toSet(),
-                                services = openPorts.map { it.label }.toSet(),
-                                sources = setOf("常见服务探测"),
+                                ports = responsive.map { it.port }.toSet(),
+                                services = responsive.map { it.label }.toSet(),
+                                sources = setOf("IP 服务探测"),
                                 manufacturer = null,
-                                deviceHint = classifyPorts(openPorts.map { it.port }.toSet()),
-                                details = mapOf("探测范围" to "仅常见服务端口"),
+                                deviceHint = "已响应网络服务（低置信度）",
+                                details = mapOf(
+                                    "服务探测说明" to "仅表示此地址响应固定服务端口，不作为设备名称或型号依据",
+                                    "名称来源" to "未知"
+                                ),
                                 lastSeenAt = System.currentTimeMillis()
                             )
                         )
+                        diagnostics.observation("IP 服务探测", "ip=$ip ports=${responsive.map { it.port }}")
                     }
-                    onProgress(LanScanProgress("正在检查当前子网的常见服务", index + 1, hosts.size))
+                    onProgress(LanScanProgress("正在检查当前 Wi‑Fi 子网的既有服务", index + 1, hosts.size))
                 }
             }
         }.awaitAll()
     }
 
-    private fun isTcpPortOpen(address: InetAddress, port: Int): Boolean = runCatching {
+    private fun isTcpPortOpen(network: Network?, address: InetAddress, port: Int): Boolean = runCatching {
         Socket().use { socket ->
+            network?.bindSocket(socket)
             socket.connect(InetSocketAddress(address, port), TCP_CONNECT_TIMEOUT_MILLIS)
             true
         }
@@ -486,69 +523,138 @@ class LanDiscoveryEngine(context: Context) {
         .lineSequence()
         .drop(1)
         .mapNotNull { line ->
-            val index = line.indexOf(':')
-            if (index > 0) line.substring(0, index).trim().lowercase() to line.substring(index + 1).trim() else null
+            val separator = line.indexOf(':')
+            if (separator > 0) line.substring(0, separator).trim().lowercase() to line.substring(separator + 1).trim() else null
         }
         .toMap()
 
-    private fun classifyService(label: String): String = when (label.lowercase()) {
-        "ipp", "printer" -> "网络打印设备"
-        "airplay", "googlecast" -> "媒体播放设备"
-        "ssh" -> "远程管理设备"
-        "smb" -> "文件共享设备"
-        "http", "https" -> "提供 Web 服务的设备"
+    private fun serviceLabel(type: String): String = when (type.removePrefix("_").removeSuffix("._tcp.").lowercase()) {
+        "ipp" -> "IPP"
+        "printer" -> "打印服务"
+        "airplay" -> "AirPlay"
+        "raop" -> "RAOP"
+        "googlecast" -> "Google Cast"
+        "ssh" -> "SSH"
+        "smb" -> "SMB"
+        "http" -> "HTTP"
+        "https" -> "HTTPS"
+        "hap" -> "HomeKit"
+        else -> type
+    }
+
+    private fun classifyService(label: String): String = when (label) {
+        "IPP", "打印服务" -> "网络打印设备"
+        "AirPlay", "RAOP", "Google Cast" -> "媒体播放设备"
+        "SSH" -> "远程管理设备"
+        "SMB" -> "文件共享设备"
         else -> "局域网服务设备"
     }
 
-    private fun classifySsdp(type: String, server: String?): String = when {
-        type.contains("MediaRenderer", ignoreCase = true) -> "媒体播放设备"
-        type.contains("MediaServer", ignoreCase = true) -> "媒体服务器"
-        server?.contains("router", ignoreCase = true) == true -> "网络网关设备"
+    private fun classifySsdp(type: String): String = when {
+        type.contains("MediaRenderer", true) -> "媒体播放设备"
+        type.contains("MediaServer", true) -> "媒体服务器"
+        type.contains("InternetGatewayDevice", true) -> "网络网关设备"
         else -> "UPnP 设备"
     }
 
-    private fun classifyPorts(ports: Set<Int>): String = when {
-        631 in ports && 9100 in ports -> "可能的打印设备（服务特征）"
-        445 in ports -> "可能的文件共享设备（服务特征）"
-        22 in ports -> "可能的远程管理设备（服务特征）"
-        80 in ports || 443 in ports -> "提供 Web 服务的设备（服务特征）"
-        else -> "响应常见网络服务的设备（服务特征）"
-    }
+    private class DeviceRegistry(
+        private val publishSnapshot: (List<LanDevice>) -> Unit,
+        private val diagnostics: DiscoveryDiagnostics
+    ) {
+        private val devices = linkedMapOf<String, LanDevice>()
+        private val aliasIndex = mutableMapOf<String, String>()
+        private val rawObservations = AtomicInteger(0)
+        private var serial = 0
 
-    private class DeviceRegistry(private val publish: (LanDevice) -> Unit) {
-        private val devices = ConcurrentHashMap<String, LanDevice>()
-
+        @Synchronized
         fun upsert(incoming: LanDevice) {
-            val primaryKey = incoming.addresses.firstOrNull()?.let { "ip:$it" } ?: incoming.id
-            val merged = devices.compute(primaryKey) { _, existing ->
-                if (existing == null) incoming.copy(id = primaryKey) else existing.merge(incoming).copy(id = primaryKey)
-            } ?: incoming
-            publish(merged)
+            rawObservations.incrementAndGet()
+            val aliases = aliasesFor(incoming)
+            val matches = aliases.mapNotNull(aliasIndex::get).distinct().filter(devices::containsKey)
+            val canonicalId = matches.firstOrNull() ?: "device:${++serial}"
+            var merged = incoming.copy(id = canonicalId)
+            matches.forEach { id ->
+                val existing = devices.remove(id) ?: return@forEach
+                merged = merge(existing, merged).copy(id = canonicalId)
+            }
+            devices[canonicalId] = merged
+            aliasesFor(merged).forEach { aliasIndex[it] = canonicalId }
+            diagnostics.devicePublished(merged)
+            publishSnapshot(snapshot())
         }
 
-        fun snapshot(): List<LanDevice> = devices.values.toList()
+        @Synchronized fun snapshot(): List<LanDevice> = devices.values.toList()
+        fun rawObservationCount(): Int = rawObservations.get()
+
+        private fun aliasesFor(device: LanDevice): Set<String> = buildSet {
+            device.addresses.filter { it.isNotBlank() }.forEach { add("ip:${it.lowercase()}") }
+            device.details["MAC 地址"]?.takeIf { it.isNotBlank() }?.let { add("mac:${it.lowercase()}") }
+            device.details["UPnP UDN"]?.takeIf { it.isNotBlank() }?.let { add("udn:${it.lowercase()}") }
+            device.details["UPnP serialNumber"]?.takeIf { it.isNotBlank() }?.let { add("serial:${it.lowercase()}") }
+            device.details["SSDP USN"]?.takeIf { it.isNotBlank() }?.let { add("usn:${it.lowercase()}") }
+            val instance = device.details["mDNS 服务实例"]
+            val type = device.details["mDNS 服务类型"]
+            if (!instance.isNullOrBlank() && !type.isNullOrBlank()) add("mdns:${instance.lowercase()}|${type.lowercase()}")
+            if (device.id.startsWith("local:")) add(device.id)
+        }
+
+        private fun merge(first: LanDevice, second: LanDevice): LanDevice {
+            val preferred = if (namePriority(second) > namePriority(first)) second else first
+            val other = if (preferred === second) first else second
+            val mergedDetails = first.details + second.details + mapOf("名称来源" to (preferred.details["名称来源"] ?: "未知"))
+            return preferred.copy(
+                hostname = preferred.hostname ?: other.hostname,
+                addresses = first.addresses + second.addresses,
+                ports = first.ports + second.ports,
+                services = first.services + second.services,
+                sources = first.sources + second.sources,
+                manufacturer = preferred.manufacturer ?: other.manufacturer,
+                deviceHint = preferredHint(first.deviceHint, second.deviceHint),
+                details = mergedDetails,
+                lastSeenAt = maxOf(first.lastSeenAt, second.lastSeenAt)
+            )
+        }
+
+        private fun namePriority(device: LanDevice): Int = when (device.details["名称来源"]) {
+            "UPnP friendlyName" -> 700
+            "mDNS hostname" -> 600
+            "DHCP hostname" -> 500
+            "mDNS 服务名称" -> 450
+            "mDNS 厂商与型号", "UPnP 厂商与型号" -> 400
+            "UPnP 厂商与设备类型" -> 300
+            else -> if (device.displayName == "未知设备") 0 else 100
+        }
+
+        private fun preferredHint(first: String, second: String): String = when {
+            second.contains("型号") && !first.contains("型号") -> second
+            first == "局域网服务设备" || first.contains("低置信度") -> second
+            else -> first
+        }
     }
 
-    companion object {
-        private const val MDNS_WINDOW_MILLIS = 900L
-        private const val SSDP_WINDOW_MILLIS = 3_000L
-        private const val SSDP_ADDRESS = "239.255.255.250"
-        private const val SSDP_PORT = 1900
-        private const val TCP_CONNECT_TIMEOUT_MILLIS = 220
-        private const val TCP_CONCURRENCY = 24
-        private val SSDP_DETAIL_KEYS = setOf("server", "st", "usn", "location", "cache-control")
-        private val COMMON_TCP_SERVICES = listOf(
-            TcpService(80, "HTTP"),
-            TcpService(443, "HTTPS"),
-            TcpService(22, "SSH"),
-            TcpService(445, "SMB"),
-            TcpService(631, "IPP"),
-            TcpService(9100, "JetDirect")
+    private companion object {
+        const val MDNS_WINDOW_MILLIS = 1_800L
+        const val MDNS_PARALLEL_DISCOVERIES = 3
+        const val SSDP_ADDRESS = "239.255.255.250"
+        const val SSDP_PORT = 1900
+        const val SSDP_WINDOW_MILLIS = 4_500L
+        const val SSDP_RECEIVE_TIMEOUT_MILLIS = 600
+        const val TCP_CONNECT_TIMEOUT_MILLIS = 320
+        const val TCP_CONCURRENCY = 16
+        val MDNS_SERVICE_TYPES = listOf(
+            "_http._tcp.", "_https._tcp.", "_ssh._tcp.", "_smb._tcp.", "_ipp._tcp.",
+            "_printer._tcp.", "_airplay._tcp.", "_raop._tcp.", "_googlecast._tcp.", "_hap._tcp."
         )
+        val EXISTING_TCP_SERVICES = listOf(
+            TcpService(80, "HTTP"), TcpService(443, "HTTPS"), TcpService(22, "SSH"),
+            TcpService(445, "SMB"), TcpService(631, "IPP"), TcpService(9100, "JetDirect")
+        )
+        const val SSDP_REQUEST = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 3\r\nST: ssdp:all\r\n\r\n"
     }
 }
 
 data class LanNetworkSnapshot(
+    val network: Network?,
     val localIp: String,
     val gateway: String?,
     val interfaceName: String,
@@ -560,11 +666,7 @@ data class LanNetworkSnapshot(
     val hasVpn: Boolean = false
 )
 
-data class LanScanProgress(
-    val message: String,
-    val completedHosts: Int,
-    val totalHosts: Int
-)
+data class LanScanProgress(val message: String, val completedHosts: Int, val totalHosts: Int)
 
 data class LanScanSummary(
     val startedAt: Long,
@@ -572,40 +674,31 @@ data class LanScanSummary(
     val discoveredCount: Int,
     val scannedHostCount: Int,
     val hotspotNeighborCount: Int = 0,
-    val hotspotNeighborCacheReadable: Boolean = false
+    val hotspotNeighborCacheReadable: Boolean = false,
+    val diagnostics: LanDiscoveryDiagnostics
 )
 
-private data class HotspotNeighbor(
-    val ipAddress: String,
-    val maskedMac: String,
-    val networkInterface: String
-) {
-    fun toLanDevice(timestamp: Long): LanDevice = LanDevice(
+private data class HotspotInterfaceCandidate(val interfaceName: String, val address: Inet4Address, val prefixLength: Short)
+private data class NeighborRead(val cacheReadable: Boolean, val entries: List<NeighborEntry>)
+private data class NeighborEntry(val ipAddress: String, val macAddress: String, val interfaceName: String) {
+    fun toLanDevice(timestamp: Long) = LanDevice(
         id = "ip:$ipAddress",
-        displayName = "热点邻居 · $ipAddress",
+        displayName = "未知设备",
         hostname = null,
         addresses = setOf(ipAddress),
         ports = emptySet(),
-        services = setOf("热点邻居缓存"),
-        sources = setOf("热点邻居缓存"),
+        services = setOf("邻居缓存"),
+        sources = setOf("ARP / 邻居缓存"),
         manufacturer = null,
-        deviceHint = "热点邻居缓存观测（型号未公开）",
+        deviceHint = "本地邻居缓存观测",
         details = mapOf(
-            "热点客户端证据" to "系统邻居缓存：仅表示当前或近期有通信的客户端",
-            "MAC 地址（已掩码）" to maskedMac,
-            "热点接口" to networkInterface
+            "MAC 地址" to macAddress,
+            "邻居接口" to interfaceName,
+            "邻居证据" to "本机 ARP/邻居缓存记录",
+            "名称来源" to "未知"
         ),
         lastSeenAt = timestamp
     )
-}
-
-private data class HotspotNeighborRead(
-    val cacheReadable: Boolean,
-    val devices: List<HotspotNeighbor>
-) {
-    companion object {
-        fun unavailable() = HotspotNeighborRead(cacheReadable = false, devices = emptyList())
-    }
 }
 
 data class LanDevice(
@@ -620,37 +713,11 @@ data class LanDevice(
     val deviceHint: String,
     val details: Map<String, String>,
     val lastSeenAt: Long
-) {
-    fun merge(other: LanDevice): LanDevice = copy(
-        displayName = preferredName(displayName, other.displayName),
-        hostname = hostname ?: other.hostname,
-        addresses = addresses + other.addresses,
-        ports = ports + other.ports,
-        services = services + other.services,
-        sources = sources + other.sources,
-        manufacturer = manufacturer ?: other.manufacturer,
-        deviceHint = preferredHint(deviceHint, other.deviceHint, other.sources),
-        details = details + other.details,
-        lastSeenAt = maxOf(lastSeenAt, other.lastSeenAt)
-    )
-
-    private fun preferredName(current: String, candidate: String): String = when {
-        current.startsWith("设备 · ") && !candidate.startsWith("设备 · ") -> candidate
-        current == "UPnP 设备" && candidate != "UPnP 设备" -> candidate
-        else -> current
-    }
-
-    private fun preferredHint(current: String, candidate: String, candidateSources: Set<String>): String = when {
-        candidateSources.any { it == "IPP 标准属性" } -> candidate
-        current == "局域网服务设备" -> candidate
-        current.contains("服务特征") && !candidate.contains("服务特征") -> candidate
-        else -> current
-    }
-}
+)
 
 data class TcpService(val port: Int, val label: String)
 
-/** IPv4 子网计算被限制为最多扫描本机所在 /24，避免对大网段发起过量连接。 */
+/** IPv4 扫描范围最多限制到本机 /24；显示实际 CIDR 与受限扫描 CIDR。 */
 data class Ipv4Subnet private constructor(
     private val addressValue: Int,
     private val prefixLength: Int,
@@ -660,7 +727,7 @@ data class Ipv4Subnet private constructor(
     val scanCidrLabel: String get() = "${toAddress(networkAddress(effectivePrefixLength)).hostAddress}/$effectivePrefixLength"
 
     fun contains(address: Inet4Address): Boolean {
-        val value = address.address.fold(0) { accumulator, byte -> (accumulator shl 8) or (byte.toInt() and 0xff) }
+        val value = address.address.fold(0) { result, byte -> (result shl 8) or (byte.toInt() and 0xff) }
         val mask = if (prefixLength == 0) 0 else -1 shl (32 - prefixLength)
         return (value and mask) == (addressValue and mask)
     }
@@ -678,21 +745,14 @@ data class Ipv4Subnet private constructor(
     }
 
     private fun toAddress(value: Int): InetAddress = InetAddress.getByAddress(
-        byteArrayOf(
-            (value ushr 24).toByte(),
-            (value ushr 16).toByte(),
-            (value ushr 8).toByte(),
-            value.toByte()
-        )
+        byteArrayOf((value ushr 24).toByte(), (value ushr 16).toByte(), (value ushr 8).toByte(), value.toByte())
     )
 
     companion object {
         fun from(address: Inet4Address, prefixLength: Int): Ipv4Subnet {
-            val value = address.address.fold(0) { accumulator, byte -> (accumulator shl 8) or (byte.toInt() and 0xff) }
-            val sanitizedPrefix = prefixLength.coerceIn(1, 30)
-            // 对 /16、/20 等大型家庭或办公网络，仅检查本机所在的 /24；小网段保持原始边界。
-            val effectivePrefix = maxOf(sanitizedPrefix, 24)
-            return Ipv4Subnet(value, sanitizedPrefix, effectivePrefix)
+            val value = address.address.fold(0) { result, byte -> (result shl 8) or (byte.toInt() and 0xff) }
+            val actualPrefix = prefixLength.coerceIn(1, 30)
+            return Ipv4Subnet(value, actualPrefix, maxOf(actualPrefix, 24))
         }
     }
 }
