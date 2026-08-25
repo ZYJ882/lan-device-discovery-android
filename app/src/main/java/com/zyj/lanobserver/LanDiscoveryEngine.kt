@@ -44,6 +44,7 @@ class LanDiscoveryEngine(context: Context) {
     private val wifiManager = appContext.applicationContext.getSystemService(WifiManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val identityResolver = DeviceIdentityResolver()
+    private val ippIdentityResolver = IppIdentityResolver()
     private val upnpIdentityCache = ConcurrentHashMap<String, PublicDeviceIdentity>()
 
     /**
@@ -290,26 +291,57 @@ class LanDiscoveryEngine(context: Context) {
                         .mapValues { (_, value) -> value.toString(StandardCharsets.UTF_8) }
                         .filterValues { it.isNotBlank() }
                     val serviceLabel = serviceInfo.serviceType.removePrefix("_").removeSuffix("._tcp.")
+                    val publicIdentity = MdnsIdentityNormalizer.normalize(attributes, serviceInfo.serviceName)
                     registry.upsert(
                         LanDevice(
                             id = address?.let { "ip:$it" } ?: "mdns:${serviceInfo.serviceName}:${serviceInfo.serviceType}",
-                            displayName = attributes["fn"]
-                                ?: attributes["model"]
-                                ?: serviceInfo.serviceName,
+                            displayName = publicIdentity.friendlyName ?: serviceInfo.serviceName,
                             hostname = host?.hostName,
                             addresses = address?.let { setOf(it) } ?: emptySet(),
                             ports = serviceInfo.port.takeIf { it > 0 }?.let { setOf(it) } ?: emptySet(),
                             services = setOf(serviceLabel),
                             sources = setOf("mDNS"),
-                            manufacturer = attributes["manufacturer"] ?: attributes["ty"],
-                            deviceHint = attributes["model"] ?: classifyService(serviceLabel),
-                            details = attributes + mapOf("服务实例" to serviceInfo.serviceName),
+                            manufacturer = publicIdentity.manufacturer,
+                            deviceHint = publicIdentity.model ?: classifyService(serviceLabel),
+                            details = attributes + mapOf("服务实例" to serviceInfo.serviceName) + publicIdentity.asDetails(),
                             lastSeenAt = System.currentTimeMillis()
                         )
                     )
+                    if (serviceLabel == "ipp" && host != null && serviceInfo.port > 0 && address != null) {
+                        val ippResourcePath = attributes.entries.firstOrNull { (key, _) -> key.equals("rp", ignoreCase = true) }?.value
+                        resolveIppIdentityAsync(host, serviceInfo.port, ippResourcePath, address, serviceInfo.serviceName, registry)
+                    }
                 }
             })
         }
+    }
+
+    private fun resolveIppIdentityAsync(
+        host: InetAddress,
+        port: Int,
+        resourcePath: String?,
+        address: String,
+        fallbackName: String,
+        registry: DeviceRegistry
+    ) {
+        Thread({
+            val identity = ippIdentityResolver.resolve(host, port, resourcePath) ?: return@Thread
+            registry.upsert(
+                LanDevice(
+                    id = "ip:$address",
+                    displayName = identity.name ?: identity.makeAndModel ?: fallbackName,
+                    hostname = host.hostName,
+                    addresses = setOf(address),
+                    ports = setOf(port),
+                    services = setOf("IPP"),
+                    sources = setOf("IPP 标准属性"),
+                    manufacturer = null,
+                    deviceHint = identity.makeAndModel ?: "网络打印设备",
+                    details = identity.asDetails(),
+                    lastSeenAt = System.currentTimeMillis()
+                )
+            )
+        }, "ipp-identity").start()
     }
 
     private suspend fun discoverSsdp(registry: DeviceRegistry) = withContext(Dispatchers.IO) {
@@ -520,7 +552,7 @@ data class LanDevice(
         services = services + other.services,
         sources = sources + other.sources,
         manufacturer = manufacturer ?: other.manufacturer,
-        deviceHint = if (deviceHint == "局域网服务设备") other.deviceHint else deviceHint,
+        deviceHint = preferredHint(deviceHint, other.deviceHint, other.sources),
         details = details + other.details,
         lastSeenAt = maxOf(lastSeenAt, other.lastSeenAt)
     )
@@ -528,6 +560,13 @@ data class LanDevice(
     private fun preferredName(current: String, candidate: String): String = when {
         current.startsWith("设备 · ") && !candidate.startsWith("设备 · ") -> candidate
         current == "UPnP 设备" && candidate != "UPnP 设备" -> candidate
+        else -> current
+    }
+
+    private fun preferredHint(current: String, candidate: String, candidateSources: Set<String>): String = when {
+        candidateSources.any { it == "IPP 标准属性" } -> candidate
+        current == "局域网服务设备" -> candidate
+        current.contains("服务特征") && !candidate.contains("服务特征") -> candidate
         else -> current
     }
 }

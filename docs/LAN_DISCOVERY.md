@@ -14,9 +14,10 @@ Android 的网络服务发现（NSD）基于 DNS-SD，可识别局域网中公�
 |---|---|---|---|
 | mDNS / DNS-SD | 查找 HTTP、HTTPS、打印、AirPlay、Google Cast、SSH、SMB 等公开服务类型 | 服务实例、IP、端口、TXT 元数据、公开型号或厂商字段 | 仅发现主动广播相应 DNS-SD 服务的设备 |
 | UPnP / SSDP | 发送标准 `M-SEARCH` 请求并接收短时间响应；可读取同一响应地址的公开描述文档 | `SERVER`、`ST`、`USN`、`LOCATION`、friendlyName、manufacturer、modelName、modelNumber | 仅处理设备自己公开的 HTTP 描述文档；拒绝跨主机、重定向和超限内容 |
+| IPP 只读属性 | 仅对已经通过 `_ipp._tcp` 发现的服务发起 `Get-Printer-Attributes` | `printer-make-and-model`、打印机名称、说明、UUID、位置和设备标识 | 不提交打印任务、不处理认证、不扫描任意端点；服务不公开时不查询 |
 | 常见服务连通性 | 对普通局域网内地址进行低频 TCP 连通性检查 | IP、响应端口及低置信度服务特征 | 仅检查 22、80、443、445、631、9100；热点或 VPN 存在时禁用，防止中间层虚假连接 |
 | 本机网络概览 | 读取当前活动网络的链路属性 | 本机 IPv4、网关、接口、实际 CIDR 与扫描 CIDR | 不读取 Wi‑Fi SSID、密码或定位数据 |
-| 移动热点子网 | 优先识别本机私有 IPv4 热点网关接口，再复用 mDNS、SSDP 与常见服务检查 | 热点网关 IP、热点子网、响应设备的公开服务 | 普通应用不读取系统 DHCP 客户端表；仅显示实际响应的热点设备 |
+| 移动热点子网 | 优先识别本机私有 IPv4 热点网关接口，再使用 mDNS、SSDP 与已确认服务的只读型号查询 | 热点网关 IP、热点子网、响应设备的公开服务与型号 | 普通应用不读取系统 DHCP 客户端表；仅显示实际响应的热点设备 |
 
 为避免在大型组织网络中产生过多连接，若当前网络比 `/24` 更大，应用只探测**本机所在的 `/24` 子网**。列表中的“未发现”不表示设备离线；客户端隔离、访客网络、防火墙、休眠、IPv6-only 网络和未公开服务都可能使设备不响应。
 
@@ -41,7 +42,11 @@ Android 的热点系统可管理关联客户端，但完整的 Soft AP 客户端
 
 ## 设备名称、厂商与型号识别
 
-应用只显示设备**主动公开**的身份信息。mDNS TXT 记录可携带 `model`、`manufacturer`、`ty` 或实例名；SSDP 的 `LOCATION` 若指向同一响应地址的 HTTP 描述文档，应用会在短超时和 64 KiB 大小限制内解析 `friendlyName`、`manufacturer`、`modelName`、`modelNumber`、`modelDescription` 与 `deviceType`。这些字段会作为“公开厂商”“公开型号”等信息显示，未公开时则显示“未识别”，不会用端口猜测伪造具体型号。[1] [4]
+应用只显示设备**主动公开**的身份信息。mDNS TXT 记录会规范化 `model`、`modelName`、`md`、`am`、`ty`、`usb_MDL`、`manufacturer`、`mfg` 与 `usb_MFG` 等常见字段；这些字段在界面中会标为“mDNS TXT 公开声明”。SSDP 的 `LOCATION` 若指向同一响应地址的 HTTP 描述文档，应用会在短超时和 64 KiB 大小限制内解析 `friendlyName`、`manufacturer`、`modelName`、`modelNumber`、`modelDescription` 与 `deviceType`，并标为“UPnP 描述公开声明”。[1] [4]
+
+对于已经以 `_ipp._tcp` 广播确认的打印机服务，应用会向 mDNS 已解析的同一主机、端口和 `rp` 资源路径发送一次 IPP `Get-Printer-Attributes` 只读请求，读取 `printer-make-and-model` 等标准属性。查询不提交任务、不跟随重定向、不尝试认证，连接和读取均有短超时与 64 KiB 响应上限。结果标为“IPP 标准只读属性”。[7]
+
+界面只把有 mDNS、UPnP 或 IPP 证据的字段称为“公开型号”；没有公开字段时显示“未发现设备公开的型号字段”。端口开放、服务名称、Banner 或通用设备类别只作为服务特征，绝不伪造为具体型号。
 
 ARP 与 MAC-OUI 不是普通 Android APK 的可靠基础。Android 10 后，对 `/proc/net` 中 ARP 信息的访问受到平台限制，且 Android 10 及以上设备默认可使用随机 MAC 地址；随机 MAC 的厂商前缀不能反映真实硬件制造商。[5] [6] 因此本应用不收集 MAC 地址，也不以 OUI 数据库生成“厂商/型号”结论。
 
@@ -88,3 +93,5 @@ export ANDROID_HOME=/path/to/android-sdk
 [5] [Google Issue Tracker：access to /proc/net/arp to resolve mac address of an IP address](https://issuetracker.google.com/issues/128554635)
 
 [6] [Android Open Source Project：MAC randomization behavior](https://source.android.com/docs/core/connect/wifi-mac-randomization-behavior)
+
+[7] [RFC 8011：Internet Printing Protocol/1.1 Model and Semantics](https://datatracker.ietf.org/doc/html/rfc8011)

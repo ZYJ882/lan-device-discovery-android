@@ -26,7 +26,7 @@ class DeviceIdentityResolver {
                 connection.connectTimeout = CONNECT_TIMEOUT_MILLIS
                 connection.readTimeout = READ_TIMEOUT_MILLIS
                 connection.requestMethod = "GET"
-                connection.setRequestProperty("User-Agent", "LanDeviceDiscovery/1.3")
+                connection.setRequestProperty("User-Agent", "LanDeviceDiscovery/1.4")
                 connection.inputStream.use { input -> input.readBounded(MAX_DESCRIPTION_BYTES) }
             }
         }.getOrNull() ?: return null
@@ -95,6 +95,7 @@ data class PublicDeviceIdentity(
         get() = listOf(friendlyName, manufacturer, modelName, modelNumber, modelDescription, deviceType).any { !it.isNullOrBlank() }
 
     fun asDetails(): Map<String, String> = buildMap {
+        put("型号识别证据", "UPnP 描述公开声明")
         friendlyName?.let { put("UPnP 设备名", it) }
         manufacturer?.let { put("公开厂商", it) }
         modelName?.let { put("公开型号", it) }

@@ -307,6 +307,12 @@ private fun DeviceCard(device: LanDevice, onClick: () -> Unit) {
                 }
                 Spacer(Modifier.height(3.dp))
                 Text(device.deviceHint, color = LanMuted, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                device.details["型号识别证据"]?.let { evidence ->
+                    Spacer(Modifier.height(5.dp))
+                    Surface(shape = RoundedCornerShape(7.dp), color = Color(0xFFE8F5EE)) {
+                        Text("公开型号 · $evidence", modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp), fontSize = 10.sp, color = LanSuccess)
+                    }
+                }
                 val addresses = device.addresses.joinToString(" · ")
                 if (addresses.isNotBlank()) {
                     Spacer(Modifier.height(6.dp))
@@ -414,9 +420,15 @@ private fun DeviceDetailDialog(
                 DeviceDetailRow("发现方式", device.sources.joinToString("、"))
                 if (device.services.isNotEmpty()) DeviceDetailRow("公开服务", device.services.joinToString("、"))
                 if (device.ports.isNotEmpty()) DeviceDetailRow("发现时响应端口", device.ports.sorted().joinToString(", "))
-                device.manufacturer?.let { DeviceDetailRow("厂商 / 型号", it) }
+                device.manufacturer?.let { DeviceDetailRow("公开厂商", it) }
+                val identityEvidence = device.details["型号识别证据"]
+                val publicModel = device.details.entries
+                    .firstOrNull { (key, value) -> key != "型号识别证据" && key.contains("型号") && value.isNotBlank() }
+                    ?.value
+                if (publicModel != null) DeviceDetailRow("公开型号", publicModel)
+                DeviceDetailRow("型号识别", identityEvidence ?: "未发现设备公开的型号字段")
                 device.details.toSortedMap().forEach { (key, value) ->
-                    if (value.isNotBlank()) DeviceDetailRow(key, value)
+                    if (key != "型号识别证据" && !key.contains("型号") && value.isNotBlank()) DeviceDetailRow(key, value)
                 }
 
                 Spacer(Modifier.height(8.dp))
