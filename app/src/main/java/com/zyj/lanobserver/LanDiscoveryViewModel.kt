@@ -54,7 +54,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
                 snapshot == null -> "未检测到可用于局域网扫描的 IPv4 网络。请连接 Wi‑Fi 或以太网后重试。"
                 uiState.isScanning -> uiState.message
                 snapshot.isHotspot -> "已识别本机移动热点。为避免误报，扫描只采用客户端实际公开的 mDNS 与 UPnP 响应。"
-                else -> "已准备就绪。扫描只读取设备公开广播与常见服务连通性。"
+                else -> "已准备就绪。扫描只识别设备 IP 与公开协议证据；端口需在设备详情中手动检查。"
             }
         )
     }
@@ -73,14 +73,14 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
             isScanning = true,
             devices = emptyList(),
             selectedDeviceId = null,
-            progress = LanScanProgress("正在准备发现服务", 0, if (snapshot.isHotspot || snapshot.hasVpn) 0 else snapshot.subnet.scanHosts().size),
+            progress = LanScanProgress("正在准备 IP 与公开服务发现", 0, 0),
             lastScanLabel = null,
             portScanStates = emptyMap(),
             onlineStates = emptyMap(),
             message = if (snapshot.isHotspot) {
-                "正在查找热点子网 ${snapshot.scanCidr} 中客户端实际公开的 mDNS 与 UPnP 服务；不会以裸 TCP 建连推断设备存在。"
+                "正在从热点子网 ${snapshot.scanCidr} 的邻居缓存、mDNS 与 UPnP 识别设备 IP；不会扫描端口。"
             } else {
-                "正在扫描 ${snapshot.scanCidr}。不会发送登录请求、读取文件或执行远程命令。"
+                "正在发现 ${snapshot.actualCidr} 中公开广播的设备 IP；不会扫描端口、发送登录请求、读取文件或执行远程命令。"
             }
         )
         scanJob = viewModelScope.launch {
@@ -108,8 +108,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
                         val arp = summary.diagnostics.sourceStats["ARP"]?.observations ?: 0
                         val mdns = summary.diagnostics.sourceStats["mDNS"]?.observations ?: 0
                         val ssdp = summary.diagnostics.sourceStats["SSDP"]?.observations ?: 0
-                        val tcp = summary.diagnostics.sourceStats["IP 服务探测"]?.observations ?: 0
-                        "扫描完成：多源原始证据 ARP $arp、mDNS $mdns、SSDP $ssdp、服务响应 $tcp；去重后 ${summary.discoveredCount} 台。${summary.scannedHostCount} 个 IPv4 地址仅用于补充服务证据，不代表完整设备数。"
+                        "扫描完成：多源原始证据 ARP $arp、mDNS $mdns、SSDP $ssdp；去重后 ${summary.discoveredCount} 台。默认扫描未检查任何 TCP/UDP 端口；请选择已发现设备后手动扫描可用端口。"
                     }
                 )
             } catch (exception: SecurityException) {
@@ -156,7 +155,10 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
         }
         portScanJob = viewModelScope.launch {
             try {
-                val result = monitoringEngine.scanCommonPorts(device) { completed, total ->
+                val result = monitoringEngine.scanCommonPorts(
+                    device = device,
+                    network = discoveryEngine.networkSnapshot()?.network
+                ) { completed, total ->
                     viewModelScope.launch {
                         updatePortScan(deviceId) { current ->
                             current.copy(completedPorts = completed, totalPorts = total)
@@ -197,7 +199,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
             while (isActive) {
                 val device = uiState.devices.firstOrNull { it.id == deviceId } ?: break
                 val result = try {
-                    monitoringEngine.checkOnline(device)
+                    monitoringEngine.checkOnline(device, discoveryEngine.networkSnapshot()?.network)
                 } catch (exception: CancellationException) {
                     throw exception
                 } catch (exception: Exception) {

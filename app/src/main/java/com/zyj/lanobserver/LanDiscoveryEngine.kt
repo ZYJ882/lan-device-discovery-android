@@ -11,7 +11,6 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -30,7 +29,6 @@ import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
-import java.net.Socket
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicInteger
@@ -39,8 +37,8 @@ import kotlin.coroutines.resume
 /**
  * 只读、多发现源的局域网设备发现引擎。
  *
- * 发现结果不是“子网地址扫描数量”，而是 ARP/邻居、mDNS、SSDP/UPnP 和既有服务探测
- * 等独立证据的合并。所有可控的网络请求均绑定到明确选择的 Wi‑Fi Network。
+ * 默认发现不扫描 TCP 端口；结果仅来自 ARP/邻居、mDNS、SSDP/UPnP 等可直接提供设备 IP 的证据。
+ * 端口扫描只在用户进入一台已发现设备详情后手动执行。所有可控的网络请求均绑定到明确选择的 Wi‑Fi Network。
  */
 class LanDiscoveryEngine(context: Context) {
     private val appContext = context.applicationContext
@@ -150,33 +148,28 @@ class LanDiscoveryEngine(context: Context) {
 
         val multicastLock = acquireMulticastLock()
         diagnostics.multicastLock(multicastLock?.isHeld == true)
-        val canSweepTcp = !snapshot.isHotspot && !snapshot.hasVpn && snapshot.network != null
-        val hostCount = if (canSweepTcp) snapshot.subnet.scanHosts().size else 0
         try {
             onProgress(
                 LanScanProgress(
-                    message = "正在通过 ARP、mDNS、SSDP 与已有服务证据发现当前 Wi‑Fi 设备",
+                    message = "正在通过 ARP、mDNS 与 SSDP 识别已公开设备 IP；不会扫描端口",
                     completedHosts = 0,
-                    totalHosts = hostCount
+                    totalHosts = 0
                 )
             )
             val mdns = async(Dispatchers.IO) { discoverMdns(snapshot, registry, diagnostics, this@coroutineScope) }
             val ssdp = async(Dispatchers.IO) { discoverSsdp(snapshot, registry, diagnostics) }
-            val tcp = async(Dispatchers.IO) {
-                if (canSweepTcp) probeExistingServices(snapshot, registry, diagnostics, onProgress)
-            }
-            awaitAll(mdns, ssdp, tcp)
+            awaitAll(mdns, ssdp)
             val finalDevices = registry.snapshot()
             val finalDiagnostics = diagnostics.finish(
                 rawObservations = registry.rawObservationCount(),
                 deduplicatedDevices = finalDevices.size,
-                scannedHosts = hostCount
+                scannedHosts = 0
             )
             LanScanSummary(
                 startedAt = startedAt,
                 finishedAt = System.currentTimeMillis(),
                 discoveredCount = finalDevices.size,
-                scannedHostCount = hostCount,
+                scannedHostCount = 0,
                 hotspotNeighborCount = if (snapshot.isHotspot) neighborRead.entries.size else 0,
                 hotspotNeighborCacheReadable = neighborRead.cacheReadable,
                 diagnostics = finalDiagnostics
@@ -469,56 +462,6 @@ class LanDiscoveryEngine(context: Context) {
         return "未知设备" to "未知"
     }
 
-    /** 固定的小型既有服务集，仅作低置信度补充，不扩大端口范围。 */
-    private suspend fun probeExistingServices(
-        snapshot: LanNetworkSnapshot,
-        registry: DeviceRegistry,
-        diagnostics: DiscoveryDiagnostics,
-        onProgress: (LanScanProgress) -> Unit
-    ) = coroutineScope {
-        diagnostics.sourceStarted("IP 服务探测")
-        val hosts = snapshot.subnet.scanHosts().filter { it.hostAddress != snapshot.localIp }
-        val semaphore = Semaphore(TCP_CONCURRENCY)
-        hosts.mapIndexed { index, address ->
-            async(Dispatchers.IO) {
-                semaphore.withPermit {
-                    val responsive = EXISTING_TCP_SERVICES.filter { service -> isTcpPortOpen(snapshot.network, address, service.port) }
-                    if (responsive.isNotEmpty()) {
-                        val ip = address.hostAddress.orEmpty()
-                        registry.upsert(
-                            LanDevice(
-                                id = "ip:$ip",
-                                displayName = "未知设备",
-                                hostname = null,
-                                addresses = setOf(ip),
-                                ports = responsive.map { it.port }.toSet(),
-                                services = responsive.map { it.label }.toSet(),
-                                sources = setOf("IP 服务探测"),
-                                manufacturer = null,
-                                deviceHint = "已响应网络服务（低置信度）",
-                                details = mapOf(
-                                    "服务探测说明" to "仅表示此地址响应固定服务端口，不作为设备名称或型号依据",
-                                    "名称来源" to "未知"
-                                ),
-                                lastSeenAt = System.currentTimeMillis()
-                            )
-                        )
-                        diagnostics.observation("IP 服务探测", "ip=$ip ports=${responsive.map { it.port }}")
-                    }
-                    onProgress(LanScanProgress("正在检查当前 Wi‑Fi 子网的既有服务", index + 1, hosts.size))
-                }
-            }
-        }.awaitAll()
-    }
-
-    private fun isTcpPortOpen(network: Network?, address: InetAddress, port: Int): Boolean = runCatching {
-        Socket().use { socket ->
-            network?.bindSocket(socket)
-            socket.connect(InetSocketAddress(address, port), TCP_CONNECT_TIMEOUT_MILLIS)
-            true
-        }
-    }.getOrDefault(false)
-
     private fun parseHeaders(message: String): Map<String, String> = message
         .lineSequence()
         .drop(1)
@@ -639,15 +582,9 @@ class LanDiscoveryEngine(context: Context) {
         const val SSDP_PORT = 1900
         const val SSDP_WINDOW_MILLIS = 4_500L
         const val SSDP_RECEIVE_TIMEOUT_MILLIS = 600
-        const val TCP_CONNECT_TIMEOUT_MILLIS = 320
-        const val TCP_CONCURRENCY = 16
         val MDNS_SERVICE_TYPES = listOf(
             "_http._tcp.", "_https._tcp.", "_ssh._tcp.", "_smb._tcp.", "_ipp._tcp.",
             "_printer._tcp.", "_airplay._tcp.", "_raop._tcp.", "_googlecast._tcp.", "_hap._tcp."
-        )
-        val EXISTING_TCP_SERVICES = listOf(
-            TcpService(80, "HTTP"), TcpService(443, "HTTPS"), TcpService(22, "SSH"),
-            TcpService(445, "SMB"), TcpService(631, "IPP"), TcpService(9100, "JetDirect")
         )
         const val SSDP_REQUEST = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 3\r\nST: ssdp:all\r\n\r\n"
     }
@@ -715,8 +652,6 @@ data class LanDevice(
     val lastSeenAt: Long
 )
 
-data class TcpService(val port: Int, val label: String)
-
 /** IPv4 扫描范围最多限制到本机 /24；显示实际 CIDR 与受限扫描 CIDR。 */
 data class Ipv4Subnet private constructor(
     private val addressValue: Int,
@@ -730,13 +665,6 @@ data class Ipv4Subnet private constructor(
         val value = address.address.fold(0) { result, byte -> (result shl 8) or (byte.toInt() and 0xff) }
         val mask = if (prefixLength == 0) 0 else -1 shl (32 - prefixLength)
         return (value and mask) == (addressValue and mask)
-    }
-
-    fun scanHosts(): List<InetAddress> {
-        val hostBits = 32 - effectivePrefixLength
-        val count = if (hostBits >= 31) 0 else (1 shl hostBits) - 2
-        val network = networkAddress(effectivePrefixLength)
-        return (1..count).map { offset -> toAddress(network + offset) }
     }
 
     private fun networkAddress(prefix: Int): Int {

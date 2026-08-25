@@ -11,10 +11,10 @@
 | 操作 | 绑定方式 |
 |---|---|
 | SSDP UDP | 新建未连接 `DatagramSocket` 后调用 `wifiNetwork.bindSocket(socket)` |
-| TCP 服务探测 | 新建未连接 `Socket` 后调用 `wifiNetwork.bindSocket(socket)` |
+| 单设备端口扫描 | 用户在设备详情明确触发后，新建未连接 `Socket` 并调用 `wifiNetwork.bindSocket(socket)` |
 | UPnP 描述 XML | `wifiNetwork.openConnection(url)` |
 | IP 地址解析 | 对本地发现的响应地址直接使用；不通过默认网络 DNS 解析 |
-| Android NSD/mDNS | 使用系统 `NsdManager` 和 Wi-Fi `MulticastLock`；记录请求、找到、解析、失败计数。当前公开 NSD API 没有通用的指定 `Network` 参数，因此不通过 VPN 默认网络重绑进程，只保留真实的系统 DNS-SD 发现证据。 |
+| Android NSD/mDNS | 使用系统 `NsdManager` 和 Wi-Fi `MulticastLock`；Android 11（API 30）及以上使用携带 Wi-Fi `Network` 的 `discoverServices` 重载，较低版本使用系统 DNS-SD 发现并记录请求、找到、解析和失败计数。 |
 
 ## 发现源
 
@@ -24,7 +24,7 @@
 | mDNS / DNS-SD | 高 | IPv4、服务实例、服务类型、hostname | IP、hostname、服务、TXT、厂商、型号 |
 | SSDP / UPnP | 高 | IPv4、USN/UDN、LOCATION | USN、SERVER、ST、CACHE-CONTROL、XML 设备信息 |
 | UPnP 描述 XML | 很高 | UDN、serialNumber、IPv4 | friendlyName、厂商、型号、设备类型、序列号 |
-| 既有常见服务探测 | 低 | IPv4 | 已响应端口和服务特征 |
+| 单设备端口扫描 | 用户触发 | 已发现设备的 IPv4 | 已响应端口和服务特征；不参与默认设备发现 |
 
 ## 统一设备模型与去重
 
@@ -44,6 +44,6 @@
 
 ## 扫描诊断
 
-`DiscoveryDiagnostics` 在每次扫描中记录以下内容并使用 `Log.i("LanDiscovery")` 输出：Wi‑Fi Network、接口、IPv4、CIDR、网关、VPN、多播锁状态；每个来源的请求、原始响应、解析成功和失败数量；IP 服务响应数量；原始观察数和最终去重设备数。每条设备日志输出 IP、可得 MAC、hostname、mDNS 身份、SSDP USN/SERVER、UPnP 字段、端口和全部来源。
+`DiscoveryDiagnostics` 在每次默认发现中记录以下内容并使用 `Log.i("LanDiscovery")` 输出：Wi‑Fi Network、接口、IPv4、CIDR、网关、VPN、多播锁状态；ARP、mDNS 与 SSDP 的请求、原始响应、解析成功和失败数量；默认端口检查数（固定为零）；原始观察数和最终去重设备数。每条设备日志输出 IP、可得 MAC、hostname、mDNS 身份、SSDP USN/SERVER、UPnP 字段、端口和全部来源。端口字段仅可来自设备公开服务或用户手动启动的单设备扫描。
 
 应用页面仅沿用既有来源标签和详情字段；本次重构不更改视觉布局。

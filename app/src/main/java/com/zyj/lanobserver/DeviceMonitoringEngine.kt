@@ -1,5 +1,6 @@
 package com.zyj.lanobserver
 
+import android.net.Network
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -22,6 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger
 class DeviceMonitoringEngine {
     suspend fun scanCommonPorts(
         device: LanDevice,
+        network: Network?,
         onProgress: (completed: Int, total: Int) -> Unit
     ): DevicePortScanResult = coroutineScope {
         val address = device.primaryIpv4Address()
@@ -31,7 +33,7 @@ class DeviceMonitoringEngine {
         val openPorts = PORT_PROFILE.map { service ->
             async(Dispatchers.IO) {
                 semaphore.withPermit {
-                    val isOpen = isTcpPortOpen(address, service.port, PORT_SCAN_TIMEOUT_MILLIS)
+                    val isOpen = isTcpPortOpen(network, address, service.port, PORT_SCAN_TIMEOUT_MILLIS)
                     onProgress(progress.incrementAndGet(), PORT_PROFILE.size)
                     service.takeIf { isOpen }
                 }
@@ -46,12 +48,12 @@ class DeviceMonitoringEngine {
         )
     }
 
-    suspend fun checkOnline(device: LanDevice): DeviceOnlineResult = withContext(Dispatchers.IO) {
+    suspend fun checkOnline(device: LanDevice, network: Network?): DeviceOnlineResult = withContext(Dispatchers.IO) {
         val address = device.primaryIpv4Address()
             ?: return@withContext DeviceOnlineResult.invalidTarget()
         val candidates = (device.ports + HEALTH_CHECK_PORTS).distinct().take(MAX_HEALTH_PORTS)
         val responsivePort = candidates.firstOrNull { port ->
-            isTcpPortOpen(address, port, HEALTH_CHECK_TIMEOUT_MILLIS)
+            isTcpPortOpen(network, address, port, HEALTH_CHECK_TIMEOUT_MILLIS)
         }
         if (responsivePort != null) {
             DeviceOnlineResult(
@@ -75,8 +77,9 @@ class DeviceMonitoringEngine {
         .mapNotNull { rawAddress -> runCatching { InetAddress.getByName(rawAddress) }.getOrNull() }
         .firstOrNull { address -> address is Inet4Address && !address.isLoopbackAddress }
 
-    private fun isTcpPortOpen(address: InetAddress, port: Int, timeoutMillis: Int): Boolean = runCatching {
+    private fun isTcpPortOpen(network: Network?, address: InetAddress, port: Int, timeoutMillis: Int): Boolean = runCatching {
         Socket().use { socket ->
+            network?.bindSocket(socket)
             socket.connect(InetSocketAddress(address, port), timeoutMillis)
             true
         }
