@@ -29,9 +29,13 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -42,14 +46,22 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import java.text.DateFormat
+import java.util.Date
+import java.util.Locale
 
 private val LanBlue = Color(0xFF185ABC)
 private val LanBlueDark = Color(0xFF0B356F)
@@ -72,8 +84,12 @@ fun LanDiscoveryScreen(
     onScanDevicePorts: (String) -> Unit,
     onCancelPortScan: () -> Unit,
     onStartMonitoring: (String) -> Unit,
-    onStopMonitoring: () -> Unit
+    onStopMonitoring: () -> Unit,
+    onIdentifyDeviceModel: (String) -> Unit,
+    onIdentifyDeviceWithOnvif: (String, String, String) -> Unit,
+    onSyncOuiDatabase: () -> Unit
 ) {
+    var showSettings by remember { mutableStateOf(false) }
     Scaffold(
         containerColor = LanPage,
         topBar = {
@@ -82,6 +98,11 @@ fun LanDiscoveryScreen(
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text("局域网设备", fontWeight = FontWeight.Bold, color = LanBlueDark)
                         Text("LAN DISCOVERY", fontSize = 10.sp, color = LanMuted, letterSpacing = 1.5.sp)
+                    }
+                },
+                actions = {
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Filled.Settings, contentDescription = "OUI 数据库设置", tint = LanBlueDark)
                     }
                 },
                 colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = LanPage)
@@ -136,11 +157,25 @@ fun LanDiscoveryScreen(
             portScan = state.portScanStates[device.id],
             onlineResult = state.onlineStates[device.id],
             isMonitoring = state.monitoredDeviceId == device.id,
+            modelRecognition = state.modelRecognitionStates[device.id],
+            ouiLookup = state.selectedOuiLookup,
             onScanPorts = { onScanDevicePorts(device.id) },
             onCancelPortScan = onCancelPortScan,
             onStartMonitoring = { onStartMonitoring(device.id) },
             onStopMonitoring = onStopMonitoring,
+            onIdentifyModel = { onIdentifyDeviceModel(device.id) },
+            onIdentifyWithOnvif = { username, password -> onIdentifyDeviceWithOnvif(device.id, username, password) },
             onDismiss = { onSelectDevice(null) }
+        )
+    }
+
+    if (showSettings) {
+        OuiSettingsDialog(
+            status = state.ouiDatabaseStatus,
+            isSyncing = state.isOuiSyncing,
+            message = state.ouiSyncMessage,
+            onSync = onSyncOuiDatabase,
+            onDismiss = { showSettings = false }
         )
     }
 }
@@ -400,10 +435,14 @@ private fun DeviceDetailDialog(
     portScan: DevicePortScanUiState?,
     onlineResult: DeviceOnlineResult?,
     isMonitoring: Boolean,
+    modelRecognition: ModelRecognitionUiState?,
+    ouiLookup: OuiLookupResult?,
     onScanPorts: () -> Unit,
     onCancelPortScan: () -> Unit,
     onStartMonitoring: () -> Unit,
     onStopMonitoring: () -> Unit,
+    onIdentifyModel: () -> Unit,
+    onIdentifyWithOnvif: (String, String) -> Unit,
     onDismiss: () -> Unit
 ) {
     val scanState = portScan ?: DevicePortScanUiState()
@@ -430,6 +469,16 @@ private fun DeviceDetailDialog(
                 device.details.toSortedMap().forEach { (key, value) ->
                     if (key != "型号识别证据" && !key.contains("型号") && value.isNotBlank()) DeviceDetailRow(key, value)
                 }
+                OuiLookupSection(ouiLookup)
+
+                Spacer(Modifier.height(8.dp))
+                HorizontalDivider(color = LanLine)
+                Spacer(Modifier.height(14.dp))
+                ModelRecognitionSection(
+                    state = modelRecognition ?: ModelRecognitionUiState(),
+                    onIdentify = onIdentifyModel,
+                    onIdentifyWithOnvif = onIdentifyWithOnvif
+                )
 
                 Spacer(Modifier.height(8.dp))
                 HorizontalDivider(color = LanLine)
@@ -482,6 +531,159 @@ private fun DeviceDetailDialog(
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(containerColor = LanSuccess)
                     ) { Text("开始在线监测") }
+                }
+            }
+        }
+    )
+}
+
+@Composable
+private fun OuiLookupSection(lookup: OuiLookupResult?) {
+    lookup ?: return
+    val value = when {
+        lookup.locallyAdministered -> "随机/本地管理 MAC，不进行 OUI 匹配"
+        !lookup.databaseAvailable -> "尚未同步 IEEE OUI 数据库"
+        !lookup.vendor.isNullOrBlank() -> "${lookup.vendor}（${lookup.prefixLength?.times(4) ?: 0} 位前缀）"
+        else -> "IEEE 本地数据库未匹配到注册厂商"
+    }
+    DeviceDetailRow("网卡厂商（OUI）", value)
+    Text(
+        "OUI 仅表示 MAC 前缀的注册网卡厂商，不代表设备厂商或具体型号；匹配只在本机完成。",
+        color = LanMuted,
+        fontSize = 11.sp,
+        lineHeight = 16.sp,
+        modifier = Modifier.padding(top = 1.dp, bottom = 6.dp)
+    )
+}
+
+@Composable
+private fun ModelRecognitionSection(
+    state: ModelRecognitionUiState,
+    onIdentify: () -> Unit,
+    onIdentifyWithOnvif: (String, String) -> Unit
+) {
+    var onvifUser by remember { mutableStateOf("") }
+    var onvifPassword by remember { mutableStateOf("") }
+    Text("型号识别", color = LanBlueDark, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+    Spacer(Modifier.height(4.dp))
+    Text(
+        "仅依据已经发现的 UPnP、IPP、mDNS 或 WS-Discovery 证据进行只读查询；不会扫描端口，也不会把 OUI、端口或 Server 头当作型号。",
+        color = LanMuted,
+        fontSize = 12.sp,
+        lineHeight = 17.sp
+    )
+    Spacer(Modifier.height(10.dp))
+    if (state.isRunning) {
+        LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
+        Spacer(Modifier.height(7.dp))
+        Text(state.result.detail, color = LanMuted, fontSize = 12.sp)
+    } else {
+        Button(
+            onClick = onIdentify,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = LanBlue)
+        ) { Text("识别型号") }
+    }
+
+    if (state.result.level != ModelRecognitionLevel.Idle && state.result.level != ModelRecognitionLevel.Running) {
+        Spacer(Modifier.height(9.dp))
+        val (label, foreground, background) = when (state.result.level) {
+            ModelRecognitionLevel.Confirmed -> Triple("已确认型号", LanSuccess, LanSuccessBg)
+            ModelRecognitionLevel.PublicDeclared -> Triple("公开声明型号", LanBlue, LanSky)
+            ModelRecognitionLevel.CategoryOnly -> Triple("仅识别设备类别", Color(0xFF9A6700), Color(0xFFFFF4E5))
+            ModelRecognitionLevel.Unavailable -> Triple("未能确认型号", Color(0xFFB42318), Color(0xFFFFF1F0))
+            ModelRecognitionLevel.NeedsCredentials -> Triple("需要 ONVIF 凭据", Color(0xFF9A6700), Color(0xFFFFF4E5))
+            else -> Triple("型号识别", LanMuted, Color(0xFFF1F5FB))
+        }
+        Surface(shape = RoundedCornerShape(10.dp), color = background, modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(11.dp)) {
+                Text(label, color = foreground, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                state.result.model?.let { Text(it, color = LanBlueDark, fontWeight = FontWeight.Medium, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp)) }
+                state.result.manufacturer?.let { Text("公开厂商：$it", color = LanMuted, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp)) }
+                state.result.category?.let { Text("设备类别：$it", color = LanBlueDark, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp)) }
+                state.result.evidence?.let { Text("证据：$it", color = LanMuted, fontSize = 11.sp, lineHeight = 16.sp, modifier = Modifier.padding(top = 4.dp)) }
+                Text(state.result.detail, color = LanMuted, fontSize = 11.sp, lineHeight = 16.sp, modifier = Modifier.padding(top = 4.dp))
+            }
+        }
+    }
+
+    if (state.result.level == ModelRecognitionLevel.NeedsCredentials) {
+        Spacer(Modifier.height(10.dp))
+        OutlinedTextField(
+            value = onvifUser,
+            onValueChange = { onvifUser = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text("ONVIF 用户名") }
+        )
+        Spacer(Modifier.height(7.dp))
+        OutlinedTextField(
+            value = onvifPassword,
+            onValueChange = { onvifPassword = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            label = { Text("ONVIF 密码") }
+        )
+        Spacer(Modifier.height(7.dp))
+        OutlinedButton(
+            onClick = { onIdentifyWithOnvif(onvifUser, onvifPassword) },
+            enabled = onvifUser.isNotBlank() && onvifPassword.isNotBlank(),
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("使用本次输入的凭据识别") }
+        Text(
+            "仅本次请求使用，应用不会保存、上传或复用凭据。",
+            color = LanMuted,
+            fontSize = 11.sp,
+            modifier = Modifier.padding(top = 6.dp)
+        )
+    }
+}
+
+@Composable
+private fun OuiSettingsDialog(
+    status: OuiDatabaseStatus,
+    isSyncing: Boolean,
+    message: String?,
+    onSync: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val lastSync = status.lastSyncedAt?.let { timestamp ->
+        DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT, Locale.CHINA).format(Date(timestamp))
+    } ?: "从未同步"
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+        title = { Text("OUI 厂商数据库", color = LanBlueDark, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                Text("数据来源", color = LanMuted, fontSize = 11.sp)
+                Text(status.sourceLabel, color = LanBlueDark, fontSize = 13.sp)
+                Spacer(Modifier.height(8.dp))
+                Text("上次同步", color = LanMuted, fontSize = 11.sp)
+                Text(lastSync, color = LanBlueDark, fontSize = 13.sp)
+                Spacer(Modifier.height(8.dp))
+                Text("本地记录数", color = LanMuted, fontSize = 11.sp)
+                Text(String.format(Locale.CHINA, "%,d 条", status.entryCount), color = LanBlueDark, fontSize = 13.sp)
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "同步仅在您手动点击后从 IEEE 官方 MA-L、MA-M、MA-S 公共注册表下载。下载失败会保留现有数据库；扫描期间不会联网查询或上传完整 MAC 地址。IEEE 对下载频率设有限制，请勿频繁同步。",
+                    color = LanMuted,
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp
+                )
+                Spacer(Modifier.height(12.dp))
+                if (isSyncing) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
+                    Spacer(Modifier.height(7.dp))
+                } else {
+                    Button(onClick = onSync, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = LanBlue)) {
+                        Text("同步 OUI 数据库")
+                    }
+                }
+                message?.let {
+                    Spacer(Modifier.height(8.dp))
+                    Text(it, color = LanMuted, fontSize = 12.sp, lineHeight = 17.sp)
                 }
             }
         }

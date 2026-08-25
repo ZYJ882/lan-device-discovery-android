@@ -11,10 +11,12 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
@@ -22,10 +24,14 @@ import java.util.Locale
 class LanDiscoveryViewModel(application: Application) : AndroidViewModel(application) {
     private val discoveryEngine = LanDiscoveryEngine(application)
     private val monitoringEngine = DeviceMonitoringEngine()
+    private val modelResolver = DeviceModelResolver()
+    private val ouiDatabase = OuiDatabase(application)
     private val connectivityManager = application.getSystemService(ConnectivityManager::class.java)
     private var scanJob: Job? = null
     private var portScanJob: Job? = null
     private var monitorJob: Job? = null
+    private var modelRecognitionJob: Job? = null
+    private var ouiSyncJob: Job? = null
 
     var uiState by mutableStateOf(LanDiscoveryUiState())
         private set
@@ -40,6 +46,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
 
     init {
         refreshNetwork()
+        refreshOuiDatabaseStatus()
         runCatching {
             val request = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
             connectivityManager.registerNetworkCallback(request, networkCallback)
@@ -223,7 +230,69 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun selectDevice(deviceId: String?) {
-        uiState = uiState.copy(selectedDeviceId = deviceId)
+        uiState = uiState.copy(selectedDeviceId = deviceId, selectedOuiLookup = null)
+        val device = uiState.devices.firstOrNull { it.id == deviceId } ?: return
+        val macAddress = device.details["MAC 地址"]?.takeIf { it.isNotBlank() } ?: return
+        viewModelScope.launch {
+            val lookup = withContext(Dispatchers.IO) { ouiDatabase.lookup(macAddress) }
+            if (uiState.selectedDeviceId == device.id) {
+                uiState = uiState.copy(selectedOuiLookup = lookup)
+            }
+        }
+    }
+
+    /** 只在详情页点击后，依据已发现的协议证据发起只读型号识别。 */
+    fun identifyDeviceModel(deviceId: String) {
+        val device = uiState.devices.firstOrNull { it.id == deviceId } ?: return
+        if (modelRecognitionJob?.isActive == true) return
+        updateModelRecognition(deviceId) { ModelRecognitionUiState(isRunning = true, result = ModelRecognitionResult.running()) }
+        modelRecognitionJob = viewModelScope.launch {
+            val result = try {
+                withContext(Dispatchers.IO) { modelResolver.identifyPublic(device, discoveryEngine.networkSnapshot()?.network) }
+            } catch (exception: CancellationException) {
+                throw exception
+            } catch (exception: Exception) {
+                ModelRecognitionResult.unavailable("识别失败：${exception.message ?: "网络暂不可用"}")
+            }
+            updateModelRecognition(deviceId) { ModelRecognitionUiState(isRunning = false, result = result) }
+        }
+    }
+
+    /** ONVIF 仅在用户明确提交凭据后调用只读 GetDeviceInformation；凭据不会保存。 */
+    fun identifyDeviceWithOnvif(deviceId: String, username: String, password: String) {
+        val device = uiState.devices.firstOrNull { it.id == deviceId } ?: return
+        if (modelRecognitionJob?.isActive == true) return
+        updateModelRecognition(deviceId) { ModelRecognitionUiState(isRunning = true, result = ModelRecognitionResult.running()) }
+        modelRecognitionJob = viewModelScope.launch {
+            val result = try {
+                withContext(Dispatchers.IO) {
+                    modelResolver.identifyOnvif(device, discoveryEngine.networkSnapshot()?.network, OnvifCredentials(username, password))
+                }
+            } catch (exception: CancellationException) {
+                throw exception
+            } catch (exception: Exception) {
+                ModelRecognitionResult.unavailable("ONVIF 识别失败：${exception.message ?: "网络暂不可用"}")
+            }
+            updateModelRecognition(deviceId) { ModelRecognitionUiState(isRunning = false, result = result) }
+        }
+    }
+
+    fun syncOuiDatabase() {
+        if (ouiSyncJob?.isActive == true) return
+        uiState = uiState.copy(isOuiSyncing = true, ouiSyncMessage = "正在从 IEEE 官方 MA-L、MA-M、MA-S 注册表同步；不会上传 MAC 地址。")
+        ouiSyncJob = viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { ouiDatabase.sync(discoveryEngine.networkSnapshot()?.network) }
+            uiState = uiState.copy(
+                isOuiSyncing = false,
+                ouiDatabaseStatus = ouiDatabase.status(),
+                ouiSyncMessage = result.message
+            )
+            refreshSelectedOuiLookup()
+        }
+    }
+
+    fun refreshOuiDatabaseStatus() {
+        uiState = uiState.copy(ouiDatabaseStatus = ouiDatabase.status())
     }
 
     fun filter(query: String) {
@@ -234,6 +303,8 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
         scanJob?.cancel()
         portScanJob?.cancel()
         monitorJob?.cancel()
+        modelRecognitionJob?.cancel()
+        ouiSyncJob?.cancel()
         runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
         super.onCleared()
     }
@@ -241,6 +312,20 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
     private fun updatePortScan(deviceId: String, transform: (DevicePortScanUiState) -> DevicePortScanUiState) {
         val current = uiState.portScanStates[deviceId] ?: DevicePortScanUiState()
         uiState = uiState.copy(portScanStates = uiState.portScanStates + (deviceId to transform(current)))
+    }
+
+    private fun updateModelRecognition(deviceId: String, transform: (ModelRecognitionUiState) -> ModelRecognitionUiState) {
+        val current = uiState.modelRecognitionStates[deviceId] ?: ModelRecognitionUiState()
+        uiState = uiState.copy(modelRecognitionStates = uiState.modelRecognitionStates + (deviceId to transform(current)))
+    }
+
+    private fun refreshSelectedOuiLookup() {
+        val selected = uiState.selectedDevice ?: return
+        val macAddress = selected.details["MAC 地址"]?.takeIf { it.isNotBlank() } ?: return
+        viewModelScope.launch {
+            val lookup = withContext(Dispatchers.IO) { ouiDatabase.lookup(macAddress) }
+            if (uiState.selectedDeviceId == selected.id) uiState = uiState.copy(selectedOuiLookup = lookup)
+        }
     }
 
     private fun publishDevices(devices: List<LanDevice>) {
@@ -278,7 +363,12 @@ data class LanDiscoveryUiState(
     val message: String = "正在读取网络状态。",
     val portScanStates: Map<String, DevicePortScanUiState> = emptyMap(),
     val onlineStates: Map<String, DeviceOnlineResult> = emptyMap(),
-    val monitoredDeviceId: String? = null
+    val monitoredDeviceId: String? = null,
+    val modelRecognitionStates: Map<String, ModelRecognitionUiState> = emptyMap(),
+    val ouiDatabaseStatus: OuiDatabaseStatus = OuiDatabaseStatus(false, 0, null, "尚未同步"),
+    val isOuiSyncing: Boolean = false,
+    val ouiSyncMessage: String? = null,
+    val selectedOuiLookup: OuiLookupResult? = null
 ) {
     val visibleDevices: List<LanDevice>
         get() {

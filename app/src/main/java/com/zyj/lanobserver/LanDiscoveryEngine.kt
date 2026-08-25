@@ -47,8 +47,6 @@ class LanDiscoveryEngine(context: Context) {
     private val wifiManager = appContext.getSystemService(WifiManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val callbackExecutor = Executor { command -> mainHandler.post(command) }
-    private val identityResolver = DeviceIdentityResolver()
-    private val ippIdentityResolver = IppIdentityResolver()
 
     /** 明确选择实际承载 IPv4 的 Wi‑Fi Network，不将 VPN 作为扫描目标。 */
     fun networkSnapshot(): LanNetworkSnapshot? {
@@ -348,50 +346,16 @@ class LanDiscoveryEngine(context: Context) {
                                 "mDNS 服务" to label,
                                 "mDNS 服务实例" to serviceInfo.serviceName,
                                 "mDNS 服务类型" to serviceInfo.serviceType,
+                                "mDNS 端口" to serviceInfo.port.takeIf { it > 0 }?.toString().orEmpty(),
                                 "名称来源" to nameSource
                             ),
                             lastSeenAt = System.currentTimeMillis()
                         )
                     )
                     diagnostics.observation("mDNS", "ip=${address ?: "none"} hostname=${hostname ?: "none"} service=$label")
-                    if (label == "IPP" && host != null && serviceInfo.port > 0 && address != null) {
-                        val resourcePath = attributes.entries.firstOrNull { (key, _) -> key.equals("rp", true) }?.value
-                        scanScope.launch(Dispatchers.IO) {
-                            resolveIppIdentity(host, serviceInfo.port, resourcePath, address, serviceInfo.serviceName, network, registry, diagnostics)
-                        }
-                    }
                 }
             })
         }.onFailure { diagnostics.sourceFailure("mDNS", "resolve request reason=${it.javaClass.simpleName}") }
-    }
-
-    private fun resolveIppIdentity(
-        host: InetAddress,
-        port: Int,
-        resourcePath: String?,
-        address: String,
-        fallbackName: String,
-        network: Network?,
-        registry: DeviceRegistry,
-        diagnostics: DiscoveryDiagnostics
-    ) {
-        val identity = ippIdentityResolver.resolve(host, port, resourcePath, network) ?: return
-        registry.upsert(
-            LanDevice(
-                id = "ip:$address",
-                displayName = identity.name ?: identity.makeAndModel ?: fallbackName,
-                hostname = host.hostName?.removeSuffix(".local."),
-                addresses = setOf(address),
-                ports = setOf(port),
-                services = setOf("IPP"),
-                sources = setOf("IPP 标准属性"),
-                manufacturer = null,
-                deviceHint = identity.makeAndModel ?: "网络打印设备",
-                details = identity.asDetails() + mapOf("名称来源" to "IPP 打印机名称"),
-                lastSeenAt = System.currentTimeMillis()
-            )
-        )
-        diagnostics.observation("IPP", "ip=$address model=${identity.makeAndModel ?: "none"}")
     }
 
     private suspend fun discoverSsdp(snapshot: LanNetworkSnapshot, registry: DeviceRegistry, diagnostics: DiscoveryDiagnostics) = withContext(Dispatchers.IO) {
@@ -414,10 +378,9 @@ class LanDiscoveryEngine(context: Context) {
                         val address = response.address.hostAddress.orEmpty()
                         diagnostics.sourceResponse("SSDP", "ip=$address usn=${headers["usn"] ?: "none"} st=${headers["st"] ?: "none"}")
                         if (address.isBlank()) continue
-                        val location = headers["location"]
-                        val identity = location?.let { identityResolver.resolveUpnpDescription(it, address, snapshot.network, diagnostics) }
                         val type = headers["st"] ?: headers["nt"] ?: "UPnP 设备"
-                        val displayName = upnpDisplayName(identity)
+                        // 默认发现仅保留 SSDP 服务证据；UPnP XML 在详情页由用户手动触发型号识别时再读取。
+                        val displayName = "未知设备" to "未知"
                         val aliases = buildMap {
                             headers["usn"]?.let { put("SSDP USN", it) }
                             headers["server"]?.let { put("SSDP SERVER", it) }
@@ -434,11 +397,11 @@ class LanDiscoveryEngine(context: Context) {
                                 ports = setOf(SSDP_PORT),
                                 services = setOf("UPnP / SSDP"),
                                 sources = setOf("SSDP / UPnP"),
-                                manufacturer = identity?.manufacturer,
-                                deviceHint = identity?.bestModel() ?: classifySsdp(type),
-                                details = aliases + (identity?.asDetails().orEmpty()) + mapOf(
+                                manufacturer = null,
+                                deviceHint = classifySsdp(type),
+                                details = aliases + mapOf(
                                     "名称来源" to displayName.second,
-                                    "UPnP 设备类型" to (identity?.deviceType ?: type)
+                                    "UPnP 设备类型" to type
                                 ),
                                 lastSeenAt = System.currentTimeMillis()
                             )
@@ -450,16 +413,6 @@ class LanDiscoveryEngine(context: Context) {
                 }
             }
         }.onFailure { diagnostics.sourceFailure("SSDP", "request reason=${it.javaClass.simpleName}") }
-    }
-
-    /** 保证 SERVER 只保留为详情字段，绝不作为用户可见名称。 */
-    private fun upnpDisplayName(identity: PublicDeviceIdentity?): Pair<String, String> {
-        identity?.bestFriendlyName()?.let { return it to "UPnP friendlyName" }
-        val manufacturerModel = listOfNotNull(identity?.manufacturer, identity?.modelName).joinToString(" ").takeIf { it.isNotBlank() }
-        if (manufacturerModel != null) return manufacturerModel to "UPnP 厂商与型号"
-        val manufacturerType = listOfNotNull(identity?.manufacturer, identity?.deviceType).joinToString(" ").takeIf { it.isNotBlank() }
-        if (manufacturerType != null) return manufacturerType to "UPnP 厂商与设备类型"
-        return "未知设备" to "未知"
     }
 
     private fun parseHeaders(message: String): Map<String, String> = message

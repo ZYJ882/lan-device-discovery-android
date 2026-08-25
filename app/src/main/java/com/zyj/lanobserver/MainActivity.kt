@@ -37,7 +37,10 @@ class MainActivity : ComponentActivity() {
                     onScanDevicePorts = viewModel::scanDevicePorts,
                     onCancelPortScan = viewModel::cancelPortScan,
                     onStartMonitoring = viewModel::startMonitoring,
-                    onStopMonitoring = viewModel::stopMonitoring
+                    onStopMonitoring = viewModel::stopMonitoring,
+                    onIdentifyDeviceModel = viewModel::identifyDeviceModel,
+                    onIdentifyDeviceWithOnvif = viewModel::identifyDeviceWithOnvif,
+                    onSyncOuiDatabase = viewModel::syncOuiDatabase
                 )
             }
         }
