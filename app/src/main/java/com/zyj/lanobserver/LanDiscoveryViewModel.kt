@@ -94,7 +94,12 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
                     progress = null,
                     lastScanLabel = "上次扫描：$finishedLabel",
                     message = if (snapshot.isHotspot) {
-                        "热点扫描完成：通过实际公开服务识别到 ${(summary.discoveredCount - 1).coerceAtLeast(0)} 台客户端。系统设置显示的已连接设备不一定都会公开服务。"
+                        val publicServiceCount = (summary.discoveredCount - 1 - summary.hotspotNeighborCount).coerceAtLeast(0)
+                        when {
+                            summary.hotspotNeighborCount > 0 -> "热点扫描完成：邻居缓存观测到 ${summary.hotspotNeighborCount} 台当前或近期通信的客户端；其中 $publicServiceCount 台公开了网络服务。"
+                            summary.hotspotNeighborCacheReadable -> "热点扫描完成：邻居缓存暂未观测到客户端，公开服务识别到 $publicServiceCount 台。系统设置中的已连接设备未必会公开服务或产生可读缓存记录。"
+                            else -> "热点扫描完成：系统限制了热点邻居缓存读取，公开服务识别到 $publicServiceCount 台。系统设置中的完整客户端列表仅系统应用可见。"
+                        }
                     } else {
                         "扫描完成：在 ${summary.scannedHostCount} 个可检查地址中发现 ${summary.discoveredCount} 台设备。未响应不代表设备不存在。"
                     }

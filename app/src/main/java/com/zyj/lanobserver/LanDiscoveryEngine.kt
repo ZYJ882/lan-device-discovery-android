@@ -20,6 +20,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
@@ -168,6 +169,8 @@ class LanDiscoveryEngine(context: Context) {
         // 中间层接受的连接误判为目标设备开放端口，因此热点和 VPN 场景只采用真实广播响应。
         val canSweepTcp = !snapshot.isHotspot && !snapshot.hasVpn
         val tcpHostCount = if (canSweepTcp) snapshot.subnet.scanHosts().size else 0
+        val hotspotNeighbors = if (snapshot.isHotspot) readHotspotNeighbors(snapshot) else HotspotNeighborRead.unavailable()
+        hotspotNeighbors.devices.forEach { neighbor -> registry.upsert(neighbor.toLanDevice(startedAt)) }
         val multicastLock = acquireMulticastLock()
         try {
             onProgress(
@@ -195,11 +198,50 @@ class LanDiscoveryEngine(context: Context) {
                 startedAt = startedAt,
                 finishedAt = System.currentTimeMillis(),
                 discoveredCount = registry.snapshot().size,
-                scannedHostCount = tcpHostCount
+                scannedHostCount = tcpHostCount,
+                hotspotNeighborCount = hotspotNeighbors.devices.size,
+                hotspotNeighborCacheReadable = hotspotNeighbors.cacheReadable
             )
         } finally {
             multicastLock?.let { lock -> if (lock.isHeld) lock.release() }
         }
+    }
+
+    /**
+     * 在部分设备上，普通应用仍可只读访问 Linux 邻居缓存。该缓存只反映近期有 L2/L3 通信的
+     * 对端，不能等同于系统热点的完整关联客户端表；若平台限制读取，返回不可用而非猜测。
+     */
+    private fun readHotspotNeighbors(snapshot: LanNetworkSnapshot): HotspotNeighborRead {
+        val arpFile = File("/proc/net/arp")
+        if (!arpFile.canRead()) return HotspotNeighborRead.unavailable()
+        return runCatching {
+            val neighbors = arpFile.useLines { lines ->
+                lines.drop(1).mapNotNull { line ->
+                    val columns = line.trim().split(Regex("\\s+"))
+                    if (columns.size < 6) return@mapNotNull null
+                    val ip = runCatching { InetAddress.getByName(columns[0]) as? Inet4Address }.getOrNull() ?: return@mapNotNull null
+                    val flags = columns[2]
+                    val mac = columns[3]
+                    val networkInterface = columns[5]
+                    if (
+                        flags != "0x2" ||
+                        mac.equals("00:00:00:00:00:00", ignoreCase = true) ||
+                        ip.hostAddress == snapshot.localIp ||
+                        !snapshot.subnet.contains(ip)
+                    ) return@mapNotNull null
+                    HotspotNeighbor(
+                        ipAddress = ip.hostAddress.orEmpty(),
+                        maskedMac = mac.maskedMac(),
+                        networkInterface = networkInterface
+                    )
+                }.toList()
+            }
+            HotspotNeighborRead(cacheReadable = true, devices = neighbors)
+        }.getOrElse { HotspotNeighborRead.unavailable() }
+    }
+
+    private fun String.maskedMac(): String = split(':').let { pieces ->
+        if (pieces.size == 6) "${pieces[0]}:${pieces[1]}:${pieces[2]}:••:••:${pieces[5]}" else "已掩码"
     }
 
     private fun acquireMulticastLock(): WifiManager.MulticastLock? = runCatching {
@@ -528,8 +570,43 @@ data class LanScanSummary(
     val startedAt: Long,
     val finishedAt: Long,
     val discoveredCount: Int,
-    val scannedHostCount: Int
+    val scannedHostCount: Int,
+    val hotspotNeighborCount: Int = 0,
+    val hotspotNeighborCacheReadable: Boolean = false
 )
+
+private data class HotspotNeighbor(
+    val ipAddress: String,
+    val maskedMac: String,
+    val networkInterface: String
+) {
+    fun toLanDevice(timestamp: Long): LanDevice = LanDevice(
+        id = "ip:$ipAddress",
+        displayName = "热点邻居 · $ipAddress",
+        hostname = null,
+        addresses = setOf(ipAddress),
+        ports = emptySet(),
+        services = setOf("热点邻居缓存"),
+        sources = setOf("热点邻居缓存"),
+        manufacturer = null,
+        deviceHint = "热点邻居缓存观测（型号未公开）",
+        details = mapOf(
+            "热点客户端证据" to "系统邻居缓存：仅表示当前或近期有通信的客户端",
+            "MAC 地址（已掩码）" to maskedMac,
+            "热点接口" to networkInterface
+        ),
+        lastSeenAt = timestamp
+    )
+}
+
+private data class HotspotNeighborRead(
+    val cacheReadable: Boolean,
+    val devices: List<HotspotNeighbor>
+) {
+    companion object {
+        fun unavailable() = HotspotNeighborRead(cacheReadable = false, devices = emptyList())
+    }
+}
 
 data class LanDevice(
     val id: String,
@@ -581,6 +658,12 @@ data class Ipv4Subnet private constructor(
 ) {
     val cidrLabel: String get() = "${toAddress(networkAddress(prefixLength)).hostAddress}/$prefixLength"
     val scanCidrLabel: String get() = "${toAddress(networkAddress(effectivePrefixLength)).hostAddress}/$effectivePrefixLength"
+
+    fun contains(address: Inet4Address): Boolean {
+        val value = address.address.fold(0) { accumulator, byte -> (accumulator shl 8) or (byte.toInt() and 0xff) }
+        val mask = if (prefixLength == 0) 0 else -1 shl (32 - prefixLength)
+        return (value and mask) == (addressValue and mask)
+    }
 
     fun scanHosts(): List<InetAddress> {
         val hostBits = 32 - effectivePrefixLength
