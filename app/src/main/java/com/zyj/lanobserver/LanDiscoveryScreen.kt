@@ -257,7 +257,6 @@ private fun NetworkStatusCard(
             network.localIpv4?.let { NetworkValueRow("IPv4", it) }
             network.carrierName?.let { NetworkValueRow("运营商", it) }
             network.gateway?.let { NetworkValueRow("网关", it) }
-            network.cidr?.let { NetworkValueRow("子网", it) }
             discoveredCount?.let { NetworkValueRow("局域网设备", "$it 台") }
             Spacer(Modifier.height(5.dp))
             Text(network.detail, color = if (network.isScanTarget) LanSuccess else LanMuted, fontSize = 12.sp, lineHeight = 17.sp)
