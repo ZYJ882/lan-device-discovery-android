@@ -15,6 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
@@ -212,15 +213,63 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
 
     fun syncOuiDatabase() {
         if (ouiSyncJob?.isActive == true) return
-        uiState = uiState.copy(isOuiSyncing = true, ouiSyncMessage = "正在从 IEEE 官方 MA-L、MA-M、MA-S 注册表同步；不会上传 MAC 地址。")
+        val (network, networkLabel) = selectOuiSyncNetwork()
+        uiState = uiState.copy(
+            isOuiSyncing = true,
+            ouiSyncMessage = "将通过${networkLabel}下载 IEEE MA-L、MA-M、MA-S 注册表；不会上传 MAC 地址。"
+        )
         ouiSyncJob = viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) { ouiDatabase.sync(uiState.network?.scanSnapshot?.network) }
+            val result = try {
+                withTimeout(OUI_SYNC_TIMEOUT_MILLIS) {
+                    withContext(Dispatchers.IO) {
+                        ouiDatabase.sync(network) { progress ->
+                            viewModelScope.launch {
+                                if (ouiSyncJob?.isActive == true) {
+                                    uiState = uiState.copy(ouiSyncMessage = "$networkLabel：$progress")
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (exception: kotlinx.coroutines.TimeoutCancellationException) {
+                OuiSyncResult(
+                    success = false,
+                    entryCount = ouiDatabase.status().entryCount,
+                    message = "同步超时：120 秒内未完成 IEEE 下载。请确认可访问互联网，或稍后重试。"
+                )
+            } catch (exception: Exception) {
+                OuiSyncResult(
+                    success = false,
+                    entryCount = ouiDatabase.status().entryCount,
+                    message = "同步失败：${exception.message ?: "网络暂不可用"}"
+                )
+            }
             uiState = uiState.copy(
                 isOuiSyncing = false,
                 ouiDatabaseStatus = ouiDatabase.status(),
                 ouiSyncMessage = result.message
             )
             refreshSelectedOuiLookup()
+        }
+    }
+
+    /** OUI 下载不沿用用户选择的局域网扫描目标，始终优先使用系统当前可联网网络。 */
+    private fun selectOuiSyncNetwork(): Pair<Network?, String> {
+        val activeNetwork = connectivityManager.activeNetwork
+        val activeCapabilities = activeNetwork?.let { connectivityManager.getNetworkCapabilities(it) }
+        if (activeNetwork != null && activeCapabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true) {
+            return activeNetwork to "系统当前网络"
+        }
+        val validatedNetwork = connectivityManager.allNetworks.firstOrNull { network ->
+            connectivityManager.getNetworkCapabilities(network)?.let { capabilities ->
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            } == true
+        }
+        return if (validatedNetwork != null) {
+            validatedNetwork to "已验证互联网网络"
+        } else {
+            null to "系统默认网络"
         }
     }
 
@@ -315,6 +364,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
 
     private companion object {
         val dateFormat: DateFormat = DateFormat.getTimeInstance(DateFormat.SHORT, Locale.CHINA)
+        const val OUI_SYNC_TIMEOUT_MILLIS = 120_000L
     }
 }
 

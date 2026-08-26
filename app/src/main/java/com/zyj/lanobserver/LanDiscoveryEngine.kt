@@ -66,19 +66,50 @@ class LanDiscoveryEngine(context: Context) {
         val vpnPresent = allNetworks.any { network ->
             connectivityManager.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
         }
-        val statuses = allNetworks.mapNotNull { network ->
+        val rawStatuses = allNetworks.mapNotNull { network ->
             val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return@mapNotNull null
             val properties = connectivityManager.getLinkProperties(network) ?: return@mapNotNull null
             statusFromNetwork(network, properties, capabilities, vpnPresent)
-        }.toMutableList()
+        }
+        // 部分移动网络会把 IPv4 与 IPv6 或 IMS / 数据承载拆为多个 Network；主页按运营商合并展示。
+        val statuses = mergeCellularStatuses(rawStatuses).toMutableList()
 
         // 热点下游接口常常没有公开 Network 句柄，作为单独网络状态补入。
-        hotspotSnapshot(vpnPresent)?.let { hotspot ->
+        hotspotSnapshot(vpnPresent, statuses.map { it.interfaceName }.toSet())?.let { hotspot ->
             if (statuses.none { it.interfaceName == hotspot.interfaceName && it.kind == LanNetworkKind.HOTSPOT }) {
                 statuses += LanNetworkStatus.fromHotspot(hotspot)
             }
         }
         return statuses.sortedWith(compareBy<LanNetworkStatus> { it.sortOrder }.thenBy { it.title })
+    }
+
+    /** 将同一运营商的多个蜂窝承载合并，避免 IPv4、IPv6 或 IMS 网络在主页重复显示为两张移动网络卡片。 */
+    private fun mergeCellularStatuses(statuses: List<LanNetworkStatus>): List<LanNetworkStatus> {
+        val nonCellular = statuses.filterNot { it.kind == LanNetworkKind.CELLULAR }
+        val mergedCellular = statuses
+            .filter { it.kind == LanNetworkKind.CELLULAR }
+            .groupBy { it.carrierName?.takeIf(String::isNotBlank) ?: "默认移动数据" }
+            .map { (carrier, group) ->
+                if (group.size == 1) return@map group.first()
+                val ipv4Source = group.firstOrNull { it.localIpv4 != null } ?: group.first()
+                val ipv6Source = group.firstOrNull { it.localIpv6 != null } ?: group.first()
+                ipv4Source.copy(
+                    id = "cellular:${group.map { it.id }.sorted().joinToString("|")}",
+                    displayName = group.mapNotNull { it.displayName }.firstOrNull(),
+                    interfaceName = group.map { it.interfaceName }.filter(String::isNotBlank).distinct().joinToString(" / "),
+                    localIpv4 = ipv4Source.localIpv4,
+                    localIpv6 = ipv6Source.localIpv6,
+                    gateway = ipv4Source.gateway ?: ipv6Source.gateway,
+                    cidr = ipv4Source.cidr,
+                    subnetMask = ipv4Source.subnetMask,
+                    carrierName = carrier.takeUnless { it == "默认移动数据" },
+                    dnsServers = group.flatMap { it.dnsServers }.distinct(),
+                    hasInternet = group.any { it.hasInternet },
+                    isValidated = group.any { it.isValidated },
+                    detail = "移动网络已连接；IPv4、IPv6 与系统承载信息已合并显示"
+                )
+            }
+        return nonCellular + mergedCellular
     }
 
     private fun statusFromNetwork(
@@ -226,11 +257,12 @@ class LanDiscoveryEngine(context: Context) {
     /**
      * 热点下游接口通常不暴露为可绑定的 Android [Network]。因此从本机活动私有 IPv4 接口中识别
      * Soft AP / USB / 蓝牙网络共享接口，并在发现时优先使用该接口作为热点局域网边界。
+     * Android 16 及以下没有可依赖的公开热点下游接口回调，故会对未被已知 Network 占用的私有 IPv4 接口作保守回退识别。
      */
-    private fun hotspotSnapshot(vpnPresent: Boolean): LanNetworkSnapshot? {
+    private fun hotspotSnapshot(vpnPresent: Boolean, knownNetworkInterfaces: Set<String>): LanNetworkSnapshot? {
         val selected = localIpv4Interfaces()
             .mapNotNull { record ->
-                hotspotInterfaceScore(record.interfaceName).takeIf { it > 0 }?.let { score -> record to score }
+                hotspotInterfaceScore(record, knownNetworkInterfaces).takeIf { it > 0 }?.let { score -> record to score }
             }
             .maxWithOrNull(compareBy<Pair<LocalIpv4Interface, Int>> { it.second }.thenBy { !it.first.address.isLinkLocalAddress })
             ?.first
@@ -272,7 +304,7 @@ class LanDiscoveryEngine(context: Context) {
         val result = mutableListOf<LocalIpv4Interface>()
         while (interfaces.hasMoreElements()) {
             val networkInterface = interfaces.nextElement()
-            if (!runCatching { networkInterface.isUp && !networkInterface.isLoopback && !networkInterface.isVirtual }.getOrDefault(false)) continue
+            if (!runCatching { networkInterface.isUp && !networkInterface.isLoopback }.getOrDefault(false)) continue
             networkInterface.interfaceAddresses
                 .filter { item -> item.address is Inet4Address && !item.address.isLoopbackAddress }
                 .forEach { item -> result += LocalIpv4Interface(networkInterface.name.orEmpty(), item.address as Inet4Address, item.networkPrefixLength) }
@@ -280,22 +312,36 @@ class LanDiscoveryEngine(context: Context) {
         return result
     }
 
-    private fun hotspotInterfaceScore(interfaceName: String): Int {
-        val name = interfaceName.lowercase()
+    private fun hotspotInterfaceScore(record: LocalIpv4Interface, knownNetworkInterfaces: Set<String>): Int {
+        val name = record.interfaceName.lowercase()
+        val isKnownNetworkInterface = knownNetworkInterfaces.any { it.equals(record.interfaceName, ignoreCase = true) }
+        val privateIpv4 = record.address.isPrivateIpv4()
         return when {
             name.contains("softap") -> 100
             name == "ap0" || name.startsWith("ap_") || name.startsWith("ap") -> 95
             name.contains("tether") -> 90
             name.contains("rndis") || name.contains("usb") -> 80
             name.contains("bt-pan") || name.contains("bnep") -> 70
+            // 部分 OEM 使用 wlan / swlan 等非标准热点接口名；仅当该私有接口未被当前 Wi‑Fi Network 占用时纳入回退候选。
+            privateIpv4 && !isKnownNetworkInterface && (name.contains("wlan") || name.contains("wifi")) -> 55
+            // 最后回退只接受未被系统 Network 使用、非蜂窝 / VPN / 虚拟隧道的私有 IPv4 接口。
+            privateIpv4 && !isKnownNetworkInterface && !name.startsWith("rmnet") && !name.startsWith("ccmni") &&
+                !name.startsWith("pdp") && !name.startsWith("tun") && !name.startsWith("ppp") && !name.startsWith("vti") -> 35
             else -> 0
         }
+    }
+
+    private fun Inet4Address.isPrivateIpv4(): Boolean {
+        val octets = address.map { it.toInt() and 0xFF }
+        return octets[0] == 10 ||
+            (octets[0] == 172 && octets[1] in 16..31) ||
+            (octets[0] == 192 && octets[1] == 168)
     }
 
     private fun localInterfaceScore(interfaceName: String): Int {
         val name = interfaceName.lowercase()
         return when {
-            hotspotInterfaceScore(interfaceName) > 0 -> 100
+            name.contains("softap") || name.startsWith("ap") || name.contains("tether") -> 100
             name.startsWith("wlan") || name.startsWith("eth") -> 80
             name.startsWith("rmnet") || name.startsWith("ccmni") || name.startsWith("pdp") -> 60
             else -> 20

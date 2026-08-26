@@ -672,7 +672,8 @@ private fun OuiSettingsDialog(
                 Text(String.format(Locale.CHINA, "%,d 条", status.entryCount), color = LanBlueDark, fontSize = 13.sp)
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    "同步仅在您手动点击后从 IEEE 官方 MA-L、MA-M、MA-S 公共注册表下载。下载失败会保留现有数据库；扫描期间不会联网查询或上传完整 MAC 地址。IEEE 对下载频率设有限制，请勿频繁同步。",
+                                         "同步仅在您手动点击后从 IEEE 官方 MA-L、MA-M、MA-S 公共注册表下载。同步会显示当前阶段，最长等待 120 秒；下载失败会保留现有数据库。扫描期间不会联网查询或上传完整 MAC 地址。IEEE 对下载频率设有限制，请勿频繁同步。"
+,
                     color = LanMuted,
                     fontSize = 12.sp,
                     lineHeight = 17.sp
@@ -687,8 +688,13 @@ private fun OuiSettingsDialog(
                     }
                 }
                 message?.let {
+                    val feedbackColor = when {
+                        it.startsWith("同步失败") || it.startsWith("同步超时") -> Color(0xFFB42318)
+                        it.startsWith("已同步") -> LanSuccess
+                        else -> LanMuted
+                    }
                     Spacer(Modifier.height(8.dp))
-                    Text(it, color = LanMuted, fontSize = 12.sp, lineHeight = 17.sp)
+                    Text(it, color = feedbackColor, fontSize = 12.sp, lineHeight = 17.sp)
                 }
             }
         }

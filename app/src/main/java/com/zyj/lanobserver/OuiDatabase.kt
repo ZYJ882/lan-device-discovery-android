@@ -2,6 +2,7 @@ package com.zyj.lanobserver
 
 import android.content.Context
 import android.net.Network
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -56,16 +57,18 @@ class OuiDatabase(context: Context) {
     }
 
     /** 用户在设置页主动点击后才下载；不包含任何后台计划或自动更新。 */
-    suspend fun sync(network: Network?): OuiSyncResult = withContext(Dispatchers.IO) {
+    suspend fun sync(network: Network?, onProgress: (String) -> Unit = {}): OuiSyncResult = withContext(Dispatchers.IO) {
         val temporaryFile = File(appContext.filesDir, "ieee_oui_registry.tsv.tmp")
         runCatching {
             val seen = HashSet<String>()
             var count = 0
             temporaryFile.bufferedWriter(Charsets.UTF_8).use { writer ->
-                IEEE_REGISTRIES.forEach { registry ->
+                IEEE_REGISTRIES.forEachIndexed { index, registry ->
+                    onProgress("正在下载 ${registry.label}（${index + 1}/${IEEE_REGISTRIES.size}）…")
                     val downloaded = downloadRegistry(registry, network, writer, seen)
                     if (downloaded == 0) throw IllegalStateException("${registry.label} 未返回可用注册表记录")
                     count += downloaded
+                    onProgress("${registry.label} 已导入 $downloaded 条记录，正在继续…")
                 }
             }
             if (count == 0) throw IllegalStateException("IEEE 注册表未返回可用记录")
@@ -74,8 +77,11 @@ class OuiDatabase(context: Context) {
             }
             cachedEntries = null
             preferences.edit().putLong(KEY_LAST_SYNC, System.currentTimeMillis()).apply()
-            OuiSyncResult(success = true, entryCount = loadEntries().size, message = "已同步 $count 条 IEEE 厂商前缀记录")
+            val entryCount = loadEntries().size
+            onProgress("同步完成：本地数据库共 $entryCount 条记录")
+            OuiSyncResult(success = true, entryCount = entryCount, message = "已同步 $count 条 IEEE 厂商前缀记录")
         }.getOrElse { error ->
+            if (error is CancellationException) throw error
             temporaryFile.delete()
             OuiSyncResult(
                 success = false,
@@ -98,8 +104,13 @@ class OuiDatabase(context: Context) {
             connection.readTimeout = READ_TIMEOUT_MILLIS
             connection.setRequestProperty("Accept", "text/csv")
             connection.setRequestProperty("User-Agent", USER_AGENT)
-            if (connection.responseCode !in 200..299) {
-                throw IllegalStateException("${registry.label} 返回 HTTP ${connection.responseCode}")
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299) {
+                val reason = connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText().take(220) }
+                    ?.replace(Regex("\\s+"), " ")
+                    ?.takeIf { it.isNotBlank() }
+                val rateLimitHint = if (responseCode == 429 || responseCode == 403) "；IEEE 公开下载通常限制为每天一次，请稍后再试" else ""
+                throw IllegalStateException("${registry.label} 返回 HTTP $responseCode${reason?.let { "：$it" }.orEmpty()}$rateLimitHint")
             }
             var added = 0
             connection.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines ->
@@ -172,9 +183,9 @@ class OuiDatabase(context: Context) {
     private companion object {
         const val PREFERENCES = "oui_database"
         const val KEY_LAST_SYNC = "last_sync"
-        const val CONNECT_TIMEOUT_MILLIS = 12_000
-        const val READ_TIMEOUT_MILLIS = 25_000
-        const val USER_AGENT = "LanDeviceDiscovery/2.1.0"
+        const val CONNECT_TIMEOUT_MILLIS = 10_000
+        const val READ_TIMEOUT_MILLIS = 20_000
+        const val USER_AGENT = "LanDeviceDiscovery/2.3.1 (Android; manual IEEE OUI sync)"
         val IEEE_REGISTRIES = listOf(
             OuiRegistry("MA-L", "https://standards-oui.ieee.org/oui/oui.csv"),
             OuiRegistry("MA-M", "https://standards-oui.ieee.org/oui28/mam.csv"),
