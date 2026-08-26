@@ -9,6 +9,7 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.telephony.TelephonyManager
 import android.os.Handler
 import android.os.Looper
 import kotlinx.coroutines.CoroutineScope
@@ -45,38 +46,159 @@ class LanDiscoveryEngine(context: Context) {
     private val connectivityManager = appContext.getSystemService(ConnectivityManager::class.java)
     private val nsdManager = appContext.getSystemService(NsdManager::class.java)
     private val wifiManager = appContext.getSystemService(WifiManager::class.java)
+    private val telephonyManager = appContext.getSystemService(TelephonyManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val callbackExecutor = Executor { command -> mainHandler.post(command) }
 
-    /** 明确选择实际承载 IPv4 的 Wi‑Fi Network，不将 VPN 作为扫描目标。 */
-    fun networkSnapshot(): LanNetworkSnapshot? {
+    /**
+     * 兼容既有详情页操作的默认扫描快照。主页不再只展示这一项；所有实际网络由 [networkStatuses] 提供。
+     */
+    fun networkSnapshot(): LanNetworkSnapshot? = networkStatuses()
+        .firstOrNull { it.scanSnapshot != null }
+        ?.scanSnapshot
+
+    /**
+     * 返回系统当前实际存在的网络状态。展示网络与扫描网络严格分离：移动网络、VPN 和其他网络可展示，
+     * 但只有具备本地 IPv4 边界的 Wi‑Fi、以太网及本机热点会附带可独立扫描的快照。
+     */
+    fun networkStatuses(): List<LanNetworkStatus> {
         val allNetworks = connectivityManager.allNetworks.toList()
         val vpnPresent = allNetworks.any { network ->
             connectivityManager.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
         }
-        val wifiSnapshots = allNetworks.mapNotNull { network ->
+        val statuses = allNetworks.mapNotNull { network ->
             val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return@mapNotNull null
-            if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return@mapNotNull null
             val properties = connectivityManager.getLinkProperties(network) ?: return@mapNotNull null
-            snapshotFromWifi(network, properties, vpnPresent, capabilities)
-        }
-        // 当本机热点已启用时，优先选择热点下游接口，即使系统同时保留 Wi‑Fi 上游网络。
-        // 这样 Wi‑Fi 共享热点不会误扫上游网络而遗漏连接到手机热点的设备。
-        return hotspotSnapshot(vpnPresent) ?: wifiSnapshots.maxByOrNull { snapshot ->
-            val caps = snapshot.network?.let(connectivityManager::getNetworkCapabilities)
-            when {
-                caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true -> 3
-                caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true -> 2
-                else -> 1
+            statusFromNetwork(network, properties, capabilities, vpnPresent)
+        }.toMutableList()
+
+        // 热点下游接口常常没有公开 Network 句柄，作为单独网络状态补入。
+        hotspotSnapshot(vpnPresent)?.let { hotspot ->
+            if (statuses.none { it.interfaceName == hotspot.interfaceName && it.kind == LanNetworkKind.HOTSPOT }) {
+                statuses += LanNetworkStatus.fromHotspot(hotspot)
             }
         }
+        return statuses.sortedWith(compareBy<LanNetworkStatus> { it.sortOrder }.thenBy { it.title })
     }
 
-    private fun snapshotFromWifi(
+    private fun statusFromNetwork(
+        network: Network,
+        properties: LinkProperties,
+        capabilities: NetworkCapabilities,
+        vpnPresent: Boolean
+    ): LanNetworkStatus {
+        val kind = when {
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> LanNetworkKind.VPN
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> LanNetworkKind.WIFI
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> LanNetworkKind.ETHERNET
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> LanNetworkKind.CELLULAR
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH) -> LanNetworkKind.BLUETOOTH
+            else -> LanNetworkKind.OTHER
+        }
+        val ipv4Address = properties.linkAddresses.firstOrNull { address ->
+            address.address is Inet4Address && !address.address.isLoopbackAddress
+        }
+        val ipv6Address = properties.linkAddresses.firstOrNull { address ->
+            address.address is java.net.Inet6Address && !address.address.isLoopbackAddress && !address.address.isLinkLocalAddress
+        }
+        val gateway = properties.routes
+            .firstOrNull { route -> route.destination.prefixLength == 0 && route.gateway != null }
+            ?.gateway
+            ?.hostAddress
+        val snapshot = if (kind == LanNetworkKind.WIFI || kind == LanNetworkKind.ETHERNET) {
+            ipv4Address?.let {
+                snapshotFromLocalNetwork(
+                    network = network,
+                    properties = properties,
+                    vpnPresent = vpnPresent,
+                    capabilities = capabilities,
+                    transportLabel = if (kind == LanNetworkKind.WIFI) "Wi‑Fi" else "以太网"
+                )
+            }
+        } else null
+        val title = when (kind) {
+            LanNetworkKind.WIFI -> "Wi‑Fi"
+            LanNetworkKind.ETHERNET -> "以太网"
+            LanNetworkKind.CELLULAR -> "移动网络"
+            LanNetworkKind.VPN -> "VPN"
+            LanNetworkKind.BLUETOOTH -> "蓝牙网络"
+            LanNetworkKind.OTHER -> "其他网络"
+            LanNetworkKind.HOTSPOT -> "个人热点"
+        }
+        val displayName = when (kind) {
+            LanNetworkKind.WIFI -> currentSsid()
+            LanNetworkKind.CELLULAR -> mobileGenerationLabel(capabilities)
+            else -> null
+        }
+        return LanNetworkStatus(
+            id = "network:${network}",
+            kind = kind,
+            title = title,
+            displayName = displayName,
+            interfaceName = properties.interfaceName.orEmpty(),
+            localIpv4 = ipv4Address?.address?.hostAddress,
+            localIpv6 = ipv6Address?.address?.hostAddress,
+            gateway = gateway,
+            cidr = ipv4Address?.let { Ipv4Subnet.from(it.address as Inet4Address, it.prefixLength).cidrLabel },
+            subnetMask = ipv4Address?.let { ipv4SubnetMask(it.prefixLength.toInt()) },
+            carrierName = if (kind == LanNetworkKind.CELLULAR) currentCarrierName() else null,
+            dnsServers = properties.dnsServers.mapNotNull { it.hostAddress }.distinct(),
+            hasInternet = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),
+            isValidated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
+            isScanTarget = snapshot != null,
+            isVpn = kind == LanNetworkKind.VPN,
+            scanSnapshot = snapshot,
+            sortOrder = kind.sortOrder,
+            detail = when {
+                kind == LanNetworkKind.VPN -> "VPN 网络通常不用于局域网设备发现"
+                snapshot != null -> "可作为独立局域网扫描目标"
+                kind == LanNetworkKind.CELLULAR -> "当前网络不支持局域网设备扫描"
+                else -> "当前网络仅展示状态，不作为局域网扫描目标"
+            }
+        )
+    }
+
+    private fun currentSsid(): String? = runCatching {
+        wifiManager.connectionInfo?.ssid
+            ?.removePrefix("\"")
+            ?.removeSuffix("\"")
+            ?.takeUnless { it.isBlank() || it == "<unknown ssid>" }
+    }.getOrNull()
+
+    private fun mobileGenerationLabel(capabilities: NetworkCapabilities): String? = runCatching {
+        when (telephonyManager?.dataNetworkType) {
+            TelephonyManager.NETWORK_TYPE_NR -> "5G"
+            TelephonyManager.NETWORK_TYPE_LTE, TelephonyManager.NETWORK_TYPE_IWLAN -> "4G / LTE"
+            TelephonyManager.NETWORK_TYPE_HSPAP, TelephonyManager.NETWORK_TYPE_HSPA,
+            TelephonyManager.NETWORK_TYPE_HSDPA, TelephonyManager.NETWORK_TYPE_HSUPA,
+            TelephonyManager.NETWORK_TYPE_UMTS -> "3G"
+            TelephonyManager.NETWORK_TYPE_EDGE, TelephonyManager.NETWORK_TYPE_GPRS,
+            TelephonyManager.NETWORK_TYPE_GSM, TelephonyManager.NETWORK_TYPE_CDMA,
+            TelephonyManager.NETWORK_TYPE_1xRTT -> "2G"
+            else -> null
+        }
+    }.getOrNull() ?: when {
+        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) -> "移动网络已连接"
+        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) -> "移动数据已连接"
+        else -> null
+    }
+
+    private fun currentCarrierName(): String? = runCatching {
+        telephonyManager?.networkOperatorName?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+
+    private fun ipv4SubnetMask(prefixLength: Int): String {
+        val prefix = prefixLength.coerceIn(0, 32)
+        val mask = if (prefix == 0) 0 else -1 shl (32 - prefix)
+        return listOf(mask ushr 24, mask ushr 16 and 0xFF, mask ushr 8 and 0xFF, mask and 0xFF).joinToString(".")
+    }
+
+    private fun snapshotFromLocalNetwork(
         network: Network,
         properties: LinkProperties,
         vpnPresent: Boolean,
-        capabilities: NetworkCapabilities
+        capabilities: NetworkCapabilities,
+        transportLabel: String
     ): LanNetworkSnapshot? {
         val linkAddress = properties.linkAddresses.firstOrNull { address ->
             address.address is Inet4Address && !address.address.isLoopbackAddress
@@ -92,7 +214,7 @@ class LanDiscoveryEngine(context: Context) {
             localIp = address.hostAddress.orEmpty(),
             gateway = gateway,
             interfaceName = properties.interfaceName.orEmpty(),
-            transport = if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) "Wi‑Fi" else "本地 Wi‑Fi",
+            transport = if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) transportLabel else "本地 $transportLabel",
             actualCidr = subnet.cidrLabel,
             scanCidr = subnet.scanCidrLabel,
             subnet = subnet,
@@ -591,6 +713,68 @@ class LanDiscoveryEngine(context: Context) {
             "_printer._tcp.", "_airplay._tcp.", "_raop._tcp.", "_googlecast._tcp.", "_hap._tcp."
         )
         const val SSDP_REQUEST = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 3\r\nST: ssdp:all\r\n\r\n"
+    }
+}
+
+enum class LanNetworkKind(val sortOrder: Int) {
+    WIFI(10),
+    HOTSPOT(20),
+    ETHERNET(30),
+    CELLULAR(40),
+    VPN(50),
+    BLUETOOTH(60),
+    OTHER(70)
+}
+
+data class LanNetworkStatus(
+    val id: String,
+    val kind: LanNetworkKind,
+    val title: String,
+    val displayName: String?,
+    val interfaceName: String,
+    val localIpv4: String?,
+    val localIpv6: String?,
+    val gateway: String?,
+    val cidr: String?,
+    val subnetMask: String?,
+    val carrierName: String?,
+    val dnsServers: List<String>,
+    val hasInternet: Boolean,
+    val isValidated: Boolean,
+    val isScanTarget: Boolean,
+    val isVpn: Boolean,
+    val scanSnapshot: LanNetworkSnapshot?,
+    val sortOrder: Int,
+    val detail: String
+) {
+    companion object {
+        private fun ipv4SubnetMaskFor(prefixLength: Int): String {
+            val prefix = prefixLength.coerceIn(0, 32)
+            val mask = if (prefix == 0) 0 else -1 shl (32 - prefix)
+            return listOf(mask ushr 24, mask ushr 16 and 0xFF, mask ushr 8 and 0xFF, mask and 0xFF).joinToString(".")
+        }
+
+        fun fromHotspot(snapshot: LanNetworkSnapshot) = LanNetworkStatus(
+            id = "hotspot:${snapshot.interfaceName}",
+            kind = LanNetworkKind.HOTSPOT,
+            title = "个人热点",
+            displayName = null,
+            interfaceName = snapshot.interfaceName,
+            localIpv4 = snapshot.localIp,
+            localIpv6 = null,
+            gateway = snapshot.gateway,
+            cidr = snapshot.actualCidr,
+            subnetMask = ipv4SubnetMaskFor(snapshot.actualCidr.substringAfterLast("/").toIntOrNull() ?: 24),
+            carrierName = null,
+            dnsServers = emptyList(),
+            hasInternet = false,
+            isValidated = false,
+            isScanTarget = true,
+            isVpn = false,
+            scanSnapshot = snapshot,
+            sortOrder = LanNetworkKind.HOTSPOT.sortOrder,
+            detail = "可作为独立热点局域网扫描目标"
+        )
     }
 }
 

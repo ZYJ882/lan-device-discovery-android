@@ -4,7 +4,9 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.graphics.Color
@@ -15,8 +17,19 @@ class MainActivity : ComponentActivity() {
         setContent {
             val viewModel: LanDiscoveryViewModel = viewModel()
             val state = viewModel.uiState
-            MaterialTheme(
-                colorScheme = lightColorScheme(
+            val colorScheme = if (isSystemInDarkTheme()) {
+                darkColorScheme(
+                    primary = Color(0xFF90CAF9),
+                    onPrimary = Color(0xFF102235),
+                    primaryContainer = Color(0xFF19324F),
+                    onPrimaryContainer = Color(0xFFE1F0FF),
+                    secondary = Color(0xFF75DAB2),
+                    background = Color(0xFF101720),
+                    surface = Color(0xFF18232F),
+                    onSurface = Color(0xFFE1E8F0)
+                )
+            } else {
+                lightColorScheme(
                     primary = Color(0xFF185ABC),
                     onPrimary = Color.White,
                     primaryContainer = Color(0xFFEAF2FF),
@@ -26,7 +39,8 @@ class MainActivity : ComponentActivity() {
                     surface = Color.White,
                     onSurface = Color(0xFF172033)
                 )
-            ) {
+            }
+            MaterialTheme(colorScheme = colorScheme) {
                 LanDiscoveryScreen(
                     state = state,
                     onStartScan = viewModel::startScan,

@@ -50,6 +50,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -63,20 +64,21 @@ import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 
-private val LanBlue = Color(0xFF185ABC)
-private val LanBlueDark = Color(0xFF0B356F)
-private val LanSky = Color(0xFFEAF2FF)
-private val LanSuccess = Color(0xFF0B7654)
-private val LanSuccessBg = Color(0xFFE7F7F0)
-private val LanMuted = Color(0xFF5F6673)
-private val LanLine = Color(0xFFE4E7EC)
-private val LanPage = Color(0xFFF7F9FC)
+private val LanBlue: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF90CAF9) else Color(0xFF185ABC)
+private val LanBlueDark: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFFE1F0FF) else Color(0xFF0B356F)
+private val LanSky: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF19324F) else Color(0xFFEAF2FF)
+private val LanSuccess: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF75DAB2) else Color(0xFF0B7654)
+private val LanSuccessBg: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF153C32) else Color(0xFFE7F7F0)
+private val LanMuted: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFFB9C4D0) else Color(0xFF5F6673)
+private val LanLine: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF344656) else Color(0xFFE4E7EC)
+private val LanPage: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF101720) else Color(0xFFF7F9FC)
+private val LanCard: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF18232F) else Color.White
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LanDiscoveryScreen(
     state: LanDiscoveryUiState,
-    onStartScan: () -> Unit,
+    onStartScan: (String) -> Unit,
     onCancelScan: () -> Unit,
     onRefreshNetwork: () -> Unit,
     onFilter: (String) -> Unit,
@@ -92,6 +94,7 @@ fun LanDiscoveryScreen(
     onSyncOuiDatabase: () -> Unit
 ) {
     var showSettings by remember { mutableStateOf(false) }
+    var selectedNetworkDetailsId by remember { mutableStateOf<String?>(null) }
     Scaffold(
         containerColor = LanPage,
         topBar = {
@@ -122,14 +125,16 @@ fun LanDiscoveryScreen(
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             item {
-                NetworkOverviewCard(
-                    network = state.network,
-                    localHost = state.localHost,
+                NetworkStatusSection(
+                    networks = state.networks,
+                    scannedDeviceCounts = state.scannedDeviceCounts,
+                    selectedNetworkId = state.selectedNetworkId,
                     isScanning = state.isScanning,
                     progress = state.progress,
-                    onStartScan = onStartScan,
+                    onRefreshNetwork = onRefreshNetwork,
+                    onScanNetwork = onStartScan,
                     onCancelScan = onCancelScan,
-                    onRefreshNetwork = onRefreshNetwork
+                    onOpenDetails = { selectedNetworkDetailsId = it }
                 )
             }
             item {
@@ -178,6 +183,10 @@ fun LanDiscoveryScreen(
         )
     }
 
+    state.networks.firstOrNull { it.id == selectedNetworkDetailsId }?.let { network ->
+        NetworkDetailDialog(network = network, onDismiss = { selectedNetworkDetailsId = null })
+    }
+
     if (showSettings) {
         OuiSettingsDialog(
             status = state.ouiDatabaseStatus,
@@ -190,122 +199,155 @@ fun LanDiscoveryScreen(
 }
 
 @Composable
-private fun NetworkOverviewCard(
-    network: LanNetworkUi?,
-    localHost: LocalHostUi,
+private fun NetworkStatusSection(
+    networks: List<LanNetworkUi>,
+    scannedDeviceCounts: Map<String, Int>,
+    selectedNetworkId: String?,
     isScanning: Boolean,
     progress: LanScanProgress?,
-    onStartScan: () -> Unit,
+    onRefreshNetwork: () -> Unit,
+    onScanNetwork: (String) -> Unit,
     onCancelScan: () -> Unit,
-    onRefreshNetwork: () -> Unit
+    onOpenDetails: (String) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("网络状态", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = LanBlueDark)
+            Spacer(Modifier.weight(1f))
+            Text("${networks.size} 个网络", color = LanMuted, fontSize = 13.sp)
+        }
+        if (networks.isEmpty()) {
+            Card(shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = LanCard), modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text("无网络连接", color = LanBlueDark, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(5.dp))
+                    Text("当前设备没有可用的网络连接。请连接 Wi‑Fi、以太网或开启个人热点。", color = LanMuted, fontSize = 13.sp, lineHeight = 19.sp)
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedButton(onClick = onRefreshNetwork, modifier = Modifier.fillMaxWidth()) { Text("重新检测网络") }
+                }
+            }
+        } else {
+            networks.forEach { network ->
+                NetworkStatusCard(
+                    network = network,
+                    discoveredCount = scannedDeviceCounts[network.id],
+                    isSelected = network.id == selectedNetworkId,
+                    isScanning = isScanning && network.id == selectedNetworkId,
+                    progress = progress,
+                    onScan = { onScanNetwork(network.id) },
+                    onCancelScan = onCancelScan,
+                    onOpenDetails = { onOpenDetails(network.id) }
+                )
+            }
+            OutlinedButton(onClick = onRefreshNetwork, modifier = Modifier.fillMaxWidth()) { Text("刷新网络状态") }
+        }
+    }
+}
+
+@Composable
+private fun NetworkStatusCard(
+    network: LanNetworkUi,
+    discoveredCount: Int?,
+    isSelected: Boolean,
+    isScanning: Boolean,
+    progress: LanScanProgress?,
+    onScan: () -> Unit,
+    onCancelScan: () -> Unit,
+    onOpenDetails: () -> Unit
 ) {
     Card(
-        shape = RoundedCornerShape(22.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White),
-        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
-        modifier = Modifier.fillMaxWidth()
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = LanCard),
+        elevation = CardDefaults.cardElevation(defaultElevation = if (isSelected) 2.dp else 1.dp),
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onOpenDetails)
     ) {
-        Column(modifier = Modifier.padding(18.dp)) {
+        Column(modifier = Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    modifier = Modifier.size(42.dp).clip(RoundedCornerShape(13.dp)).background(LanSky),
-                    contentAlignment = Alignment.Center
-                ) { Text("LAN", color = LanBlue, fontWeight = FontWeight.ExtraBold, fontSize = 12.sp) }
-                Spacer(Modifier.width(12.dp))
+                NetworkTypeMark(network.kind)
+                Spacer(Modifier.width(10.dp))
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("当前网络", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = LanBlueDark)
-                    Text(network?.transport ?: "正在等待网络", color = LanMuted, fontSize = 13.sp)
+                    Text(network.title, color = LanBlueDark, fontWeight = FontWeight.Bold)
+                    network.displayName?.let { Text(it, color = LanMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
                 }
-                StatusBadge(if (network == null) "未连接" else "已连接", network != null)
+                StatusBadge(if (network.isValidated || network.isScanTarget) "已连接" else "已存在", network.isValidated || network.isScanTarget)
             }
-            Spacer(Modifier.height(17.dp))
-            if (network == null) {
-                Text("未检测到可用于设备发现的 Wi‑Fi 或热点局域网。仍可开始发现；本机接口会以“本机设备”显示在设备列表中。", color = LanMuted, fontSize = 14.sp, lineHeight = 20.sp)
-                Spacer(Modifier.height(12.dp))
-                NetworkValueRow("本机 IPv4", localHost.localIp ?: "未获取")
-                localHost.interfaceName?.let { NetworkValueRow("本机接口", it) }
-                localHost.cidr?.let { NetworkValueRow("地址范围", it) }
+            network.localIpv4?.let { NetworkValueRow("IPv4", it) }
+            network.carrierName?.let { NetworkValueRow("运营商", it) }
+            network.gateway?.let { NetworkValueRow("网关", it) }
+            network.cidr?.let { NetworkValueRow("子网", it) }
+            discoveredCount?.let { NetworkValueRow("局域网设备", "$it 台") }
+            Spacer(Modifier.height(5.dp))
+            Text(network.detail, color = if (network.isScanTarget) LanSuccess else LanMuted, fontSize = 12.sp, lineHeight = 17.sp)
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = onOpenDetails) { Text("网络详情") }
+                Spacer(Modifier.weight(1f))
+                if (network.isScanTarget) {
+                    if (isScanning) {
+                        OutlinedButton(onClick = onCancelScan) { Text("停止扫描") }
+                    } else {
+                        Button(onClick = onScan, colors = ButtonDefaults.buttonColors(containerColor = LanBlue)) { Text("扫描此网络") }
+                    }
+                }
+            }
+            if (isScanning) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
                 Spacer(Modifier.height(5.dp))
-                Surface(color = LanSky, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
-                    Text(
-                        localHost.detail,
-                        color = LanMuted,
-                        fontSize = 12.sp,
-                        lineHeight = 17.sp,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
-                    )
-                }
-                Spacer(Modifier.height(14.dp))
-                OutlinedButton(onClick = onRefreshNetwork, modifier = Modifier.fillMaxWidth()) { Text("重新检测网络") }
-                Spacer(Modifier.height(10.dp))
-                if (isScanning) {
-                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
-                    Spacer(Modifier.height(7.dp))
-                    Text(progress?.message ?: "正在准备发现", color = LanMuted, fontSize = 12.sp)
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedButton(onClick = onCancelScan, modifier = Modifier.fillMaxWidth()) { Text("停止扫描") }
-                } else {
-                    Button(onClick = onStartScan, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = LanBlue)) {
-                        Text("开始发现设备")
-                    }
-                }
-            } else {
-                NetworkValueRow("本机 IP", network.localIp)
-                NetworkValueRow(if (network.isHotspot) "热点网关" else "默认网关", network.gateway ?: "未获取")
-                NetworkValueRow("网络范围", network.actualCidr)
-                if (network.isHotspot) {
-                    Spacer(Modifier.height(5.dp))
-                    Surface(color = LanSuccessBg, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
-                        Text(
-                                                        "热点模式：仅以客户端实际公开的 mDNS、UPnP 响应识别设备；不会以裸 TCP 建连推断设备存在。"
-,
-                            color = LanSuccess,
-                            fontSize = 12.sp,
-                            lineHeight = 17.sp,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
-                        )
-                    }
-                }
-                if (network.hasVpn) {
-                    Spacer(Modifier.height(7.dp))
-                    Surface(color = Color(0xFFFFF4E5), shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
-                        Text(
-                            "检测到 VPN：已自动禁用 TCP 子网扫掠，避免代理或中间层导致虚假设备。",
-                            color = Color(0xFF9A6700),
-                            fontSize = 12.sp,
-                            lineHeight = 17.sp,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
-                        )
-                    }
-                }
-                if (network.actualCidr != network.scanCidr) {
-                    NetworkValueRow("本次扫描", "${network.scanCidr}（限制为本机 /24）")
-                }
-                if (isScanning) {
-                    Spacer(Modifier.height(14.dp))
-                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
-                    Spacer(Modifier.height(7.dp))
-                    Text(
-                        progress?.let { item ->
-                            if (item.totalHosts > 0) "${item.message} · ${item.completedHosts}/${item.totalHosts}" else item.message
-                        } ?: "正在扫描",
-                        color = LanMuted,
-                        fontSize = 12.sp
-                    )
-                }
-                Spacer(Modifier.height(16.dp))
-                if (isScanning) {
-                    OutlinedButton(onClick = onCancelScan, modifier = Modifier.fillMaxWidth()) { Text("停止扫描") }
-                } else {
-                    Button(
-                        onClick = onStartScan,
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = LanBlue)
-                    ) { Text(if (network.isHotspot) "扫描热点设备" else "开始发现设备") }
-                }
+                Text(progress?.let { if (it.totalHosts > 0) "${it.message} · ${it.completedHosts}/${it.totalHosts}" else it.message } ?: "正在准备扫描", color = LanMuted, fontSize = 11.sp)
             }
         }
     }
+}
+
+@Composable
+private fun NetworkTypeMark(kind: LanNetworkKind) {
+    val label = when (kind) {
+        LanNetworkKind.WIFI -> "Wi"
+        LanNetworkKind.HOTSPOT -> "热"
+        LanNetworkKind.ETHERNET -> "网"
+        LanNetworkKind.CELLULAR -> "移"
+        LanNetworkKind.VPN -> "VPN"
+        LanNetworkKind.BLUETOOTH -> "蓝"
+        LanNetworkKind.OTHER -> "其"
+    }
+    val background = when (kind) {
+        LanNetworkKind.CELLULAR -> Color(0xFFF1EBFF)
+        LanNetworkKind.VPN -> Color(0xFFFFF4E5)
+        LanNetworkKind.HOTSPOT -> LanSuccessBg
+        else -> LanSky
+    }
+    Box(modifier = Modifier.size(38.dp).clip(RoundedCornerShape(12.dp)).background(background), contentAlignment = Alignment.Center) {
+        Text(label, color = LanBlueDark, fontSize = if (label.length > 2) 9.sp else 12.sp, fontWeight = FontWeight.ExtraBold)
+    }
+}
+
+@Composable
+private fun NetworkDetailDialog(network: LanNetworkUi, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+        title = { Text("${network.title}详情", color = LanBlueDark, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+                network.displayName?.let { DeviceDetailRow("名称", it) }
+                DeviceDetailRow("状态", if (network.isValidated || network.isScanTarget) "已连接" else "已存在")
+                network.localIpv4?.let { DeviceDetailRow("IPv4", it) }
+                network.localIpv6?.let { DeviceDetailRow("IPv6", it) }
+                network.gateway?.let { DeviceDetailRow("默认网关", it) }
+                network.subnetMask?.let { DeviceDetailRow("子网掩码", it) }
+                network.cidr?.let { DeviceDetailRow("CIDR", it) }
+                network.carrierName?.let { DeviceDetailRow("运营商", it) }
+                if (network.interfaceName.isNotBlank()) DeviceDetailRow("网络接口", network.interfaceName)
+                if (network.dnsServers.isNotEmpty()) DeviceDetailRow("DNS", network.dnsServers.joinToString("\n"))
+                DeviceDetailRow("互联网", if (network.isValidated) "已验证可访问" else if (network.hasInternet) "已配置，尚未验证" else "未声明互联网能力")
+                DeviceDetailRow("扫描资格", if (network.isScanTarget) "可独立扫描此局域网" else "仅状态展示，不作为局域网扫描目标")
+                Spacer(Modifier.height(8.dp))
+                Surface(color = LanSky, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
+                    Text(network.detail, color = LanMuted, fontSize = 12.sp, lineHeight = 17.sp, modifier = Modifier.padding(10.dp))
+                }
+            }
+        }
+    )
 }
 
 @Composable
@@ -364,7 +406,7 @@ private fun DeviceToolbar(count: Int, query: String, onFilter: (String) -> Unit)
 private fun DeviceCard(device: LanDevice, onClick: () -> Unit) {
     Card(
         shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White),
+        colors = CardDefaults.cardColors(containerColor = LanCard),
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)
     ) {
@@ -427,7 +469,7 @@ private fun DeviceTagRow(tags: List<String>) {
 
 @Composable
 private fun SearchingPlaceholder() {
-    Surface(color = Color.White, shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
+    Surface(color = LanCard, shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Text("正在等待设备响应", fontWeight = FontWeight.Bold, color = LanBlueDark)
             Spacer(Modifier.height(5.dp))
@@ -438,14 +480,14 @@ private fun SearchingPlaceholder() {
 
 @Composable
 private fun EmptyFilterPlaceholder() {
-    Surface(color = Color.White, shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
+    Surface(color = LanCard, shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
         Text("没有设备与当前筛选条件匹配。", modifier = Modifier.padding(22.dp), color = LanMuted, fontSize = 14.sp)
     }
 }
 
 @Composable
 private fun EmptyDevicePlaceholder() {
-    Surface(color = Color.White, shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
+    Surface(color = LanCard, shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Text("尚未开始扫描", fontWeight = FontWeight.Bold, color = LanBlueDark)
             Spacer(Modifier.height(5.dp))

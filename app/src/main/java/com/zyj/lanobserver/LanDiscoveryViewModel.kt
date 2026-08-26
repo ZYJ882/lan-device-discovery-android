@@ -38,58 +38,69 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
         private set
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) = refreshNetwork()
+        override fun onAvailable(network: Network) = scheduleNetworkRefresh()
 
-        override fun onLost(network: Network) = refreshNetwork()
+        override fun onLost(network: Network) = scheduleNetworkRefresh()
 
-        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) = refreshNetwork()
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) = scheduleNetworkRefresh()
+
+        override fun onLinkPropertiesChanged(network: Network, linkProperties: android.net.LinkProperties) = scheduleNetworkRefresh()
     }
 
     init {
         refreshNetwork()
         refreshOuiDatabaseStatus()
         runCatching {
-            val request = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
+            // 监听所有实际存在的网络；VPN、移动网络和热点状态也需要刷新主页卡片。
+            val request = NetworkRequest.Builder()
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build()
             connectivityManager.registerNetworkCallback(request, networkCallback)
         }
     }
 
+    private fun scheduleNetworkRefresh() {
+        viewModelScope.launch { refreshNetwork() }
+    }
+
     fun refreshNetwork() {
-        val snapshot = discoveryEngine.networkSnapshot()
+        val networks = discoveryEngine.networkStatuses().map { it.toUi() }
+        val selectedNetwork = networks.firstOrNull { it.id == uiState.selectedNetworkId && it.scanSnapshot != null }
+            ?: networks.firstOrNull { it.scanSnapshot != null }
         val localHost = discoveryEngine.localHostInfo().toUi()
-        val localDevice = if (snapshot == null) localHost.toLanDevice() else null
+        val localDevice = if (selectedNetwork == null) localHost.toLanDevice() else null
         uiState = uiState.copy(
-            network = snapshot?.toUi(),
+            networks = networks,
+            network = selectedNetwork,
+            selectedNetworkId = selectedNetwork?.id,
             localHost = localHost,
-            devices = if (snapshot == null) listOfNotNull(localDevice) else uiState.devices,
-            selectedDeviceId = uiState.selectedDeviceId?.takeIf { selectedId -> snapshot != null || selectedId == localDevice?.id },
+            devices = if (selectedNetwork == null) listOfNotNull(localDevice) else uiState.devices,
+            selectedDeviceId = uiState.selectedDeviceId?.takeIf { selectedId -> selectedNetwork != null || selectedId == localDevice?.id },
             message = when {
-                snapshot == null && localHost.localIp != null -> "未检测到可用于局域网扫描的 Wi‑Fi 或热点网络。已显示本机 IPv4；可手动检测本机固定常见端口。"
-                snapshot == null -> "未检测到可用于局域网扫描的 IPv4 网络，也未获取到本机 IPv4 接口。请连接 Wi‑Fi、开启热点或重新检测。"
+                selectedNetwork == null && networks.isEmpty() -> "无网络连接。请连接 Wi‑Fi、以太网或开启个人热点后重试。"
+                selectedNetwork == null && localHost.localIp != null -> "当前仅检测到不支持局域网设备扫描的网络。本机接口已作为“本机设备”显示。"
+                selectedNetwork == null -> "当前网络不支持局域网设备扫描；请连接 Wi‑Fi、以太网或开启个人热点。"
                 uiState.isScanning -> uiState.message
-                snapshot.isHotspot -> "已识别本机移动热点。为避免误报，扫描只采用客户端实际公开的 mDNS 与 UPnP 响应。"
-                else -> "已准备就绪。扫描只识别设备 IP 与公开协议证据；端口需在设备详情中手动检查。"
+                selectedNetwork.isHotspot -> "已识别本机移动热点。扫描仅采用客户端实际公开的邻居、mDNS 与 UPnP 证据。"
+                else -> "请选择网络卡片中的“扫描此网络”，只收集设备 IP 与公开服务证据。"
             }
         )
     }
 
-    fun startScan() {
+    fun startScan(networkId: String) {
         if (uiState.isScanning) return
-        val snapshot = discoveryEngine.networkSnapshot()
+        val networkUi = uiState.networks.firstOrNull { it.id == networkId }
+        val snapshot = networkUi?.scanSnapshot
         if (snapshot == null) {
-            val localDevice = uiState.localHost.toLanDevice()
-            uiState = uiState.copy(
-                devices = listOfNotNull(localDevice),
-                selectedDeviceId = uiState.selectedDeviceId?.takeIf { it == localDevice?.id },
-                message = "未检测到可扫描的局域网。本机接口已作为“本机设备”显示；点击该设备可检查本机固定常见端口。"
-            )
+            uiState = uiState.copy(message = "该网络仅用于状态展示，不支持局域网设备扫描。")
             return
         }
         stopMonitoring()
         portScanJob?.cancel()
         localPortScanJob?.cancel()
         uiState = uiState.copy(
-            network = snapshot.toUi(),
+            network = networkUi,
+            selectedNetworkId = networkUi.id,
             isScanning = true,
             devices = emptyList(),
             selectedDeviceId = null,
@@ -116,7 +127,8 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
                 uiState = uiState.copy(
                     isScanning = false,
                     progress = null,
-                    lastScanLabel = "上次扫描：$finishedLabel",
+                    lastScanLabel = "上次扫描：$finishedLabel · ${networkUi.title}",
+                    scannedDeviceCounts = uiState.scannedDeviceCounts + (networkUi.id to (summary.discoveredCount - 1).coerceAtLeast(0)),
                     message = if (snapshot.isHotspot) {
                         val publicServiceCount = (summary.discoveredCount - 1 - summary.hotspotNeighborCount).coerceAtLeast(0)
                         when {
@@ -177,7 +189,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
             try {
                 val result = monitoringEngine.scanCommonPorts(
                     device = device,
-                    network = discoveryEngine.networkSnapshot()?.network
+                    network = uiState.network?.scanSnapshot?.network
                 ) { completed, total ->
                     viewModelScope.launch {
                         updatePortScan(deviceId) { current ->
@@ -269,7 +281,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
             while (isActive) {
                 val device = uiState.devices.firstOrNull { it.id == deviceId } ?: break
                 val result = try {
-                    monitoringEngine.checkOnline(device, discoveryEngine.networkSnapshot()?.network)
+                    monitoringEngine.checkOnline(device, uiState.network?.scanSnapshot?.network)
                 } catch (exception: CancellationException) {
                     throw exception
                 } catch (exception: Exception) {
@@ -311,7 +323,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
         updateModelRecognition(deviceId) { ModelRecognitionUiState(isRunning = true, result = ModelRecognitionResult.running()) }
         modelRecognitionJob = viewModelScope.launch {
             val result = try {
-                withContext(Dispatchers.IO) { modelResolver.identifyPublic(device, discoveryEngine.networkSnapshot()?.network) }
+                withContext(Dispatchers.IO) { modelResolver.identifyPublic(device, uiState.network?.scanSnapshot?.network) }
             } catch (exception: CancellationException) {
                 throw exception
             } catch (exception: Exception) {
@@ -329,7 +341,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
         modelRecognitionJob = viewModelScope.launch {
             val result = try {
                 withContext(Dispatchers.IO) {
-                    modelResolver.identifyOnvif(device, discoveryEngine.networkSnapshot()?.network, OnvifCredentials(username, password))
+                    modelResolver.identifyOnvif(device, uiState.network?.scanSnapshot?.network, OnvifCredentials(username, password))
                 }
             } catch (exception: CancellationException) {
                 throw exception
@@ -344,7 +356,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
         if (ouiSyncJob?.isActive == true) return
         uiState = uiState.copy(isOuiSyncing = true, ouiSyncMessage = "正在从 IEEE 官方 MA-L、MA-M、MA-S 注册表同步；不会上传 MAC 地址。")
         ouiSyncJob = viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) { ouiDatabase.sync(discoveryEngine.networkSnapshot()?.network) }
+            val result = withContext(Dispatchers.IO) { ouiDatabase.sync(uiState.network?.scanSnapshot?.network) }
             uiState = uiState.copy(
                 isOuiSyncing = false,
                 ouiDatabaseStatus = ouiDatabase.status(),
@@ -430,14 +442,25 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
         detail = detail
     )
 
-    private fun LanNetworkSnapshot.toUi() = LanNetworkUi(
-        localIp = localIp,
+    private fun LanNetworkStatus.toUi() = LanNetworkUi(
+        id = id,
+        kind = kind,
+        title = title,
+        displayName = displayName,
+        interfaceName = interfaceName,
+        localIpv4 = localIpv4,
+        localIpv6 = localIpv6,
         gateway = gateway,
-        transport = transport,
-        actualCidr = actualCidr,
-        scanCidr = scanCidr,
-        isHotspot = isHotspot,
-        hasVpn = hasVpn
+        cidr = cidr,
+        subnetMask = subnetMask,
+        carrierName = carrierName,
+        dnsServers = dnsServers,
+        hasInternet = hasInternet,
+        isValidated = isValidated,
+        isScanTarget = isScanTarget,
+        isVpn = isVpn,
+        detail = detail,
+        scanSnapshot = scanSnapshot
     )
 
     private companion object {
@@ -446,7 +469,10 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
 }
 
 data class LanDiscoveryUiState(
+    val networks: List<LanNetworkUi> = emptyList(),
     val network: LanNetworkUi? = null,
+    val selectedNetworkId: String? = null,
+    val scannedDeviceCounts: Map<String, Int> = emptyMap(),
     val localHost: LocalHostUi = LocalHostUi(),
     val localPortScan: DevicePortScanUiState = DevicePortScanUiState(),
     val isScanning: Boolean = false,
@@ -501,11 +527,24 @@ data class LocalHostUi(
 )
 
 data class LanNetworkUi(
-    val localIp: String,
+    val id: String,
+    val kind: LanNetworkKind,
+    val title: String,
+    val displayName: String?,
+    val interfaceName: String,
+    val localIpv4: String?,
+    val localIpv6: String?,
     val gateway: String?,
-    val transport: String,
-    val actualCidr: String,
-    val scanCidr: String,
-    val isHotspot: Boolean = false,
-    val hasVpn: Boolean = false
-)
+    val cidr: String?,
+    val subnetMask: String?,
+    val carrierName: String?,
+    val dnsServers: List<String>,
+    val hasInternet: Boolean,
+    val isValidated: Boolean,
+    val isScanTarget: Boolean,
+    val isVpn: Boolean,
+    val detail: String,
+    val scanSnapshot: LanNetworkSnapshot?
+) {
+    val isHotspot: Boolean get() = kind == LanNetworkKind.HOTSPOT
+}

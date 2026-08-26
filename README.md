@@ -4,7 +4,7 @@
 
 应用包名为 `com.zyj.lanobserver`，最低支持 Android 8.0（API 26），当前以 Android SDK 35 为编译和目标版本。用户主动扫描后，设备列表只保留在内存中；应用不要求账号，也不会上传扫描结果、IP 或 MAC 地址。
 
-## 2.1.2 主要功能
+## 2.2.0 主要功能
 
 | 功能 | 说明 |
 |---|---|
@@ -15,6 +15,9 @@
 | **ONVIF 授权查询** | 已发现 ONVIF / WS-Discovery 地址时，先要求用户输入本次使用的凭据，再发送只读 `GetDeviceInformation`；凭据不保存、不复用 |
 | **OUI 本地厂商辅助** | 首页右上角设置可手动同步 IEEE MA-L、MA-M、MA-S 注册表。最长前缀匹配仅在本机运行；随机/本地管理 MAC 不匹配，OUI 不代表设备厂商或型号 |
 | **前台在线监测** | 仅在应用前台每 15 秒检查一台已发现设备的已知常见服务端口，可主动停止 |
+| **实时多网络状态** | 首页分别显示当前实际存在的 Wi‑Fi、个人热点、移动网络、以太网、VPN、蓝牙与其他网络；网络可用、丢失、能力或链路属性变化后自动刷新卡片 |
+| **网络详情** | 点击网络卡片可查看可获得的 IPv4、IPv6、网关、子网掩码、CIDR、DNS、接口、互联网状态与扫描资格；不可获得字段直接隐藏 |
+| **按网络独立扫描** | 每个具备本地 IPv4 边界的 Wi‑Fi、以太网或热点卡片都有“扫描此网络”。扫描使用该卡片对应的 `Network` / `LinkProperties`，不会把多个网段混合扫描，也不使用移动网络或 VPN 作为目标 |
 | **热点下游局域网优先** | 热点打开时优先识别 Soft AP / 网络共享下游 IPv4 接口，即使手机同时保留 Wi‑Fi 上游网络也不会误把发现流量优先发向上游；热点中仍只采用可读邻居缓存与公开服务证据 |
 | **无局域网本机设备** | 没有可扫描的 Wi‑Fi 或热点网络时，本机 IPv4、接口与 CIDR 会作为设备列表中的“本机设备”显示；这不会把蜂窝或链路本地地址变成外部扫描目标 |
 | **本机固定端口检测** | 用户进入“本机设备”详情后，才可手动检查当前显示的本机 IPv4 的同一 14 个固定常见端口；不检查任何外部地址、端口范围或用户输入目标 |
@@ -26,7 +29,7 @@
 
 > IEEE OUI 仅描述 MAC 前缀的**注册网卡厂商**。它不能确认设备厂商，更不能确认设备型号。完整 MAC 不会上传；扫描期间不会在线查询 OUI。
 
-详细的发现流、型号证据等级、ONVIF 凭据边界、OUI 同步和 Android 权限说明见 [`docs/LAN_DISCOVERY.md`](docs/LAN_DISCOVERY.md) 与 [`docs/OUI_DATABASE.md`](docs/OUI_DATABASE.md)。
+详细的发现流、型号证据等级、ONVIF 凭据边界、OUI 同步、Android 权限与多网络主页实现说明见 [`docs/LAN_DISCOVERY.md`](docs/LAN_DISCOVERY.md)、[`docs/OUI_DATABASE.md`](docs/OUI_DATABASE.md) 与 [`docs/MULTI_NETWORK_IMPLEMENTATION_NOTES.md`](docs/MULTI_NETWORK_IMPLEMENTATION_NOTES.md)。
 
 ## 构建与安装
 
@@ -46,7 +49,7 @@ Debug APK 位于 `app/build/outputs/apk/debug/app-debug.apk`，采用调试签�
 ```text
 lan-device-discovery-android/
 ├── app/src/main/java/com/zyj/lanobserver/
-│   ├── LanDiscoveryEngine.kt        # 热点下游优先的 IP/公开服务发现引擎
+│   ├── LanDiscoveryEngine.kt        # 多网络状态与热点下游优先的 IP/公开服务发现引擎
 │   ├── DeviceModelResolver.kt        # 详情页按需 UPnP、IPP、mDNS、ONVIF 识别
 │   ├── OuiDatabase.kt                # 本地 IEEE OUI 同步与最长前缀匹配
 │   ├── DeviceMonitoringEngine.kt     # 单设备与本机固定端口检测、在线检查
@@ -54,6 +57,7 @@ lan-device-discovery-android/
 │   └── LanDiscoveryScreen.kt         # 首页、设置和详情界面
 ├── docs/
 │   ├── LAN_DISCOVERY.md              # 发现与型号识别边界
+│   ├── MULTI_NETWORK_IMPLEMENTATION_NOTES.md # 多网络状态与扫描绑定说明
 │   └── OUI_DATABASE.md               # IEEE OUI 数据库与隐私说明
 └── releases/                          # 已发布 Debug APK 与发行说明
 ```
