@@ -57,9 +57,12 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
     fun refreshNetwork() {
         val snapshot = discoveryEngine.networkSnapshot()
         val localHost = discoveryEngine.localHostInfo().toUi()
+        val localDevice = if (snapshot == null) localHost.toLanDevice() else null
         uiState = uiState.copy(
             network = snapshot?.toUi(),
             localHost = localHost,
+            devices = if (snapshot == null) listOfNotNull(localDevice) else uiState.devices,
+            selectedDeviceId = uiState.selectedDeviceId?.takeIf { selectedId -> snapshot != null || selectedId == localDevice?.id },
             message = when {
                 snapshot == null && localHost.localIp != null -> "未检测到可用于局域网扫描的 Wi‑Fi 或热点网络。已显示本机 IPv4；可手动检测本机固定常见端口。"
                 snapshot == null -> "未检测到可用于局域网扫描的 IPv4 网络，也未获取到本机 IPv4 接口。请连接 Wi‑Fi、开启热点或重新检测。"
@@ -74,7 +77,12 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
         if (uiState.isScanning) return
         val snapshot = discoveryEngine.networkSnapshot()
         if (snapshot == null) {
-            uiState = uiState.copy(message = "无法获取可扫描的局域网。可查看本机 IPv4，并按需检测本机固定常见端口。")
+            val localDevice = uiState.localHost.toLanDevice()
+            uiState = uiState.copy(
+                devices = listOfNotNull(localDevice),
+                selectedDeviceId = uiState.selectedDeviceId?.takeIf { it == localDevice?.id },
+                message = "未检测到可扫描的局域网。本机接口已作为“本机设备”显示；点击该设备可检查本机固定常见端口。"
+            )
             return
         }
         stopMonitoring()
@@ -390,6 +398,28 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
                 compareByDescending<LanDevice> { it.id.startsWith("local:") }
                     .thenBy { it.displayName.lowercase(Locale.getDefault()) }
             )
+        )
+    }
+
+    private fun LocalHostUi.toLanDevice(): LanDevice? {
+        val address = localIp ?: return null
+        return LanDevice(
+            id = "local:$address",
+            displayName = "本机设备",
+            hostname = null,
+            addresses = setOf(address),
+            ports = emptySet(),
+            services = setOf("本机接口"),
+            sources = setOf("本机网络信息"),
+            manufacturer = null,
+            deviceHint = "本机 IPv4（未检测到可扫描局域网）",
+            details = buildMap {
+                interfaceName?.let { put("网络接口", it) }
+                cidr?.let { put("本机地址范围", it) }
+                put("本机网络状态", detail)
+                put("名称来源", "本机网络信息")
+            },
+            lastSeenAt = System.currentTimeMillis()
         )
     }
 

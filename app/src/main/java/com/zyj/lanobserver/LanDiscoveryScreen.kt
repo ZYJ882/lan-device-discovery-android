@@ -127,12 +127,9 @@ fun LanDiscoveryScreen(
                     localHost = state.localHost,
                     isScanning = state.isScanning,
                     progress = state.progress,
-                    localPortScan = state.localPortScan,
                     onStartScan = onStartScan,
                     onCancelScan = onCancelScan,
-                    onRefreshNetwork = onRefreshNetwork,
-                    onScanLocalHostPorts = onScanLocalHostPorts,
-                    onCancelLocalHostPortScan = onCancelLocalHostPortScan
+                    onRefreshNetwork = onRefreshNetwork
                 )
             }
             item {
@@ -158,15 +155,21 @@ fun LanDiscoveryScreen(
     }
 
     state.selectedDevice?.let { device ->
+        val isStandaloneLocalHost = state.network == null && device.id == state.localHost.localIp?.let { "local:$it" }
         DeviceDetailDialog(
             device = device,
-            portScan = state.portScanStates[device.id],
+            portScan = if (isStandaloneLocalHost) state.localPortScan else state.portScanStates[device.id],
             onlineResult = state.onlineStates[device.id],
             isMonitoring = state.monitoredDeviceId == device.id,
             modelRecognition = state.modelRecognitionStates[device.id],
             ouiLookup = state.selectedOuiLookup,
-            onScanPorts = { onScanDevicePorts(device.id) },
-            onCancelPortScan = onCancelPortScan,
+            isStandaloneLocalHost = isStandaloneLocalHost,
+            onScanPorts = {
+                if (isStandaloneLocalHost) onScanLocalHostPorts() else onScanDevicePorts(device.id)
+            },
+            onCancelPortScan = {
+                if (isStandaloneLocalHost) onCancelLocalHostPortScan() else onCancelPortScan()
+            },
             onStartMonitoring = { onStartMonitoring(device.id) },
             onStopMonitoring = onStopMonitoring,
             onIdentifyModel = { onIdentifyDeviceModel(device.id) },
@@ -192,12 +195,9 @@ private fun NetworkOverviewCard(
     localHost: LocalHostUi,
     isScanning: Boolean,
     progress: LanScanProgress?,
-    localPortScan: DevicePortScanUiState,
     onStartScan: () -> Unit,
     onCancelScan: () -> Unit,
-    onRefreshNetwork: () -> Unit,
-    onScanLocalHostPorts: () -> Unit,
-    onCancelLocalHostPortScan: () -> Unit
+    onRefreshNetwork: () -> Unit
 ) {
     Card(
         shape = RoundedCornerShape(22.dp),
@@ -220,7 +220,7 @@ private fun NetworkOverviewCard(
             }
             Spacer(Modifier.height(17.dp))
             if (network == null) {
-                Text("未检测到可用于设备发现的 Wi‑Fi 或热点局域网。以下仅显示本机接口状态，不会扫描任何外部地址。", color = LanMuted, fontSize = 14.sp, lineHeight = 20.sp)
+                Text("未检测到可用于设备发现的 Wi‑Fi 或热点局域网。仍可开始发现；本机接口会以“本机设备”显示在设备列表中。", color = LanMuted, fontSize = 14.sp, lineHeight = 20.sp)
                 Spacer(Modifier.height(12.dp))
                 NetworkValueRow("本机 IPv4", localHost.localIp ?: "未获取")
                 localHost.interfaceName?.let { NetworkValueRow("本机接口", it) }
@@ -235,36 +235,20 @@ private fun NetworkOverviewCard(
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
                     )
                 }
-                if (localHost.localIp != null) {
-                    Spacer(Modifier.height(14.dp))
-                    HorizontalDivider(color = LanLine)
-                    Spacer(Modifier.height(12.dp))
-                    Text("本机端口检测", color = LanBlueDark, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                    Spacer(Modifier.height(4.dp))
-                    Text("仅检查本机 IPv4 的 14 个固定常见 TCP 服务端口；不会扫描外部地址、端口范围或发送协议载荷。", color = LanMuted, fontSize = 12.sp, lineHeight = 17.sp)
-                    Spacer(Modifier.height(9.dp))
-                    if (localPortScan.isScanning) {
-                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
-                        Spacer(Modifier.height(6.dp))
-                        Text("${localPortScan.message ?: "正在检测"} · ${localPortScan.completedPorts}/${localPortScan.totalPorts}", color = LanMuted, fontSize = 12.sp)
-                        Spacer(Modifier.height(8.dp))
-                        OutlinedButton(onClick = onCancelLocalHostPortScan, modifier = Modifier.fillMaxWidth()) { Text("停止本机端口检测") }
-                    } else {
-                        Button(onClick = onScanLocalHostPorts, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = LanBlue)) {
-                            Text("检测本机 14 个常见端口")
-                        }
-                    }
-                    localPortScan.result?.let { result ->
-                        Spacer(Modifier.height(8.dp))
-                        result.errorMessage?.let { Text(it, color = Color(0xFFB42318), fontSize = 12.sp) }
-                        if (result.errorMessage == null) {
-                            val open = result.openServices.joinToString("、") { "${it.label} (${it.port})" }
-                            Text("本机可建立连接的端口：${open.ifBlank { "未检测到开放的常见服务端口" }}", color = LanMuted, fontSize = 12.sp, lineHeight = 17.sp)
-                        }
-                    }
-                }
                 Spacer(Modifier.height(14.dp))
                 OutlinedButton(onClick = onRefreshNetwork, modifier = Modifier.fillMaxWidth()) { Text("重新检测网络") }
+                Spacer(Modifier.height(10.dp))
+                if (isScanning) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
+                    Spacer(Modifier.height(7.dp))
+                    Text(progress?.message ?: "正在准备发现", color = LanMuted, fontSize = 12.sp)
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = onCancelScan, modifier = Modifier.fillMaxWidth()) { Text("停止扫描") }
+                } else {
+                    Button(onClick = onStartScan, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = LanBlue)) {
+                        Text("开始发现设备")
+                    }
+                }
             } else {
                 NetworkValueRow("本机 IP", network.localIp)
                 NetworkValueRow(if (network.isHotspot) "热点网关" else "默认网关", network.gateway ?: "未获取")
@@ -489,6 +473,7 @@ private fun DeviceDetailDialog(
     isMonitoring: Boolean,
     modelRecognition: ModelRecognitionUiState?,
     ouiLookup: OuiLookupResult?,
+    isStandaloneLocalHost: Boolean,
     onScanPorts: () -> Unit,
     onCancelPortScan: () -> Unit,
     onStartMonitoring: () -> Unit,
@@ -512,32 +497,42 @@ private fun DeviceDetailDialog(
                 if (device.services.isNotEmpty()) DeviceDetailRow("公开服务", device.services.joinToString("、"))
                 if (device.ports.isNotEmpty()) DeviceDetailRow("发现时响应端口", device.ports.sorted().joinToString(", "))
                 device.manufacturer?.let { DeviceDetailRow("公开厂商", it) }
-                val identityEvidence = device.details["型号识别证据"]
-                val publicModel = device.details.entries
-                    .firstOrNull { (key, value) -> key != "型号识别证据" && key.contains("型号") && value.isNotBlank() }
-                    ?.value
-                if (publicModel != null) DeviceDetailRow("公开型号", publicModel)
-                DeviceDetailRow("型号识别", identityEvidence ?: "未发现设备公开的型号字段")
+                if (!isStandaloneLocalHost) {
+                    val identityEvidence = device.details["型号识别证据"]
+                    val publicModel = device.details.entries
+                        .firstOrNull { (key, value) -> key != "型号识别证据" && key.contains("型号") && value.isNotBlank() }
+                        ?.value
+                    if (publicModel != null) DeviceDetailRow("公开型号", publicModel)
+                    DeviceDetailRow("型号识别", identityEvidence ?: "未发现设备公开的型号字段")
+                }
                 device.details.toSortedMap().forEach { (key, value) ->
                     if (key != "型号识别证据" && !key.contains("型号") && value.isNotBlank()) DeviceDetailRow(key, value)
                 }
                 OuiLookupSection(ouiLookup)
 
-                Spacer(Modifier.height(8.dp))
-                HorizontalDivider(color = LanLine)
-                Spacer(Modifier.height(14.dp))
-                ModelRecognitionSection(
-                    state = modelRecognition ?: ModelRecognitionUiState(),
-                    onIdentify = onIdentifyModel,
-                    onIdentifyWithOnvif = onIdentifyWithOnvif
-                )
+                if (!isStandaloneLocalHost) {
+                    Spacer(Modifier.height(8.dp))
+                    HorizontalDivider(color = LanLine)
+                    Spacer(Modifier.height(14.dp))
+                    ModelRecognitionSection(
+                        state = modelRecognition ?: ModelRecognitionUiState(),
+                        onIdentify = onIdentifyModel,
+                        onIdentifyWithOnvif = onIdentifyWithOnvif
+                    )
+                }
 
                 Spacer(Modifier.height(8.dp))
                 HorizontalDivider(color = LanLine)
                 Spacer(Modifier.height(14.dp))
-                Text("端口扫描", color = LanBlueDark, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Text(if (isStandaloneLocalHost) "本机端口检测" else "端口扫描", color = LanBlueDark, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                 Spacer(Modifier.height(4.dp))
-                Text("仅检查此已发现设备的 14 个常见服务端口；不发送协议载荷或认证请求。", color = LanMuted, fontSize = 12.sp, lineHeight = 17.sp)
+                Text(
+                    if (isStandaloneLocalHost) "仅检查此本机 IPv4 的 14 个固定常见 TCP 服务端口；不会检查外部地址、端口范围或发送协议载荷。"
+                    else "仅检查此已发现设备的 14 个常见服务端口；不发送协议载荷或认证请求。",
+                    color = LanMuted,
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp
+                )
                 Spacer(Modifier.height(10.dp))
                 if (scanState.isScanning) {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
@@ -550,7 +545,7 @@ private fun DeviceDetailDialog(
                         onClick = onScanPorts,
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(containerColor = LanBlue)
-                    ) { Text("扫描 14 个常见端口") }
+                    ) { Text(if (isStandaloneLocalHost) "检测本机 14 个常见端口" else "扫描 14 个常见端口") }
                 }
                 scanState.result?.let { result ->
                     Spacer(Modifier.height(7.dp))
@@ -562,27 +557,29 @@ private fun DeviceDetailDialog(
                     }
                 }
 
-                Spacer(Modifier.height(8.dp))
-                HorizontalDivider(color = LanLine)
-                Spacer(Modifier.height(14.dp))
-                Text("在线状态监测", color = LanBlueDark, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                Spacer(Modifier.height(6.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    StatusBadge(onlineResult?.status?.label ?: DeviceOnlineStatus.Unknown.label, onlineResult?.status == DeviceOnlineStatus.Online)
-                    Spacer(Modifier.width(8.dp))
-                    Text(onlineResult?.detail ?: "尚未检查此设备的连通性", color = LanMuted, fontSize = 12.sp, modifier = Modifier.weight(1f))
-                }
-                Spacer(Modifier.height(8.dp))
-                Text("开启后仅在应用前台每 15 秒检查一次已知常见服务端口；无响应不代表设备一定离线。", color = LanMuted, fontSize = 12.sp, lineHeight = 17.sp)
-                Spacer(Modifier.height(9.dp))
-                if (isMonitoring) {
-                    OutlinedButton(onClick = onStopMonitoring, modifier = Modifier.fillMaxWidth()) { Text("停止在线监测") }
-                } else {
-                    Button(
-                        onClick = onStartMonitoring,
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = LanSuccess)
-                    ) { Text("开始在线监测") }
+                if (!isStandaloneLocalHost) {
+                    Spacer(Modifier.height(8.dp))
+                    HorizontalDivider(color = LanLine)
+                    Spacer(Modifier.height(14.dp))
+                    Text("在线状态监测", color = LanBlueDark, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Spacer(Modifier.height(6.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        StatusBadge(onlineResult?.status?.label ?: DeviceOnlineStatus.Unknown.label, onlineResult?.status == DeviceOnlineStatus.Online)
+                        Spacer(Modifier.width(8.dp))
+                        Text(onlineResult?.detail ?: "尚未检查此设备的连通性", color = LanMuted, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text("开启后仅在应用前台每 15 秒检查一次已知常见服务端口；无响应不代表设备一定离线。", color = LanMuted, fontSize = 12.sp, lineHeight = 17.sp)
+                    Spacer(Modifier.height(9.dp))
+                    if (isMonitoring) {
+                        OutlinedButton(onClick = onStopMonitoring, modifier = Modifier.fillMaxWidth()) { Text("停止在线监测") }
+                    } else {
+                        Button(
+                            onClick = onStartMonitoring,
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = LanSuccess)
+                        ) { Text("开始在线监测") }
+                    }
                 }
             }
         }
