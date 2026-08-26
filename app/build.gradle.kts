@@ -12,8 +12,8 @@ android {
         applicationId = "com.zyj.lanobserver"
         minSdk = 26
         targetSdk = 35
-        versionCode = 17
-        versionName = "2.3.3"
+        versionCode = 18
+        versionName = "2.3.4"
     }
 
     buildFeatures {

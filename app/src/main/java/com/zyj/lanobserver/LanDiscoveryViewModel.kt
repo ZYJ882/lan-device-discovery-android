@@ -106,11 +106,12 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
 
         )
         val discoveryNetworkLabel = networkUi.discoveryNetworkLabel()
+        val discoverySubnet = networkUi.cidr?.takeIf { it.isNotBlank() }
         scanJob = viewModelScope.launch {
             try {
                 val summary = discoveryEngine.scan(
                     snapshot = snapshot,
-                    onDevicesChanged = { devices -> publishDevices(devices, discoveryNetworkLabel) },
+                    onDevicesChanged = { devices -> publishDevices(devices, discoveryNetworkLabel, discoverySubnet) },
                     onProgress = { progress ->
                         uiState = uiState.copy(progress = progress)
                     }
@@ -305,9 +306,17 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
     }
 
     /** 设备归属只记录本次用户明确点击的发现网络，不从地址范围或接口名称反向猜测。 */
-    private fun publishDevices(devices: List<LanDevice>, discoveryNetworkLabel: String) {
+    private fun publishDevices(
+        devices: List<LanDevice>,
+        discoveryNetworkLabel: String,
+        discoverySubnet: String?
+    ) {
         val taggedDevices = devices.map { device ->
-            device.copy(details = device.details + ("发现网络" to discoveryNetworkLabel))
+            val networkDetails = buildMap {
+                put("发现网络", discoveryNetworkLabel)
+                discoverySubnet?.let { put("发现子网", it) }
+            }
+            device.copy(details = device.details + networkDetails)
         }
         uiState = uiState.copy(
             devices = taggedDevices.sortedWith(
@@ -319,8 +328,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
 
     private fun LanNetworkUi.discoveryNetworkLabel(): String {
         val name = displayName?.takeIf { it.isNotBlank() }
-        val addressRange = cidr?.takeIf { it.isNotBlank() }
-        return listOfNotNull(title, name, addressRange).joinToString(" · ")
+        return listOfNotNull(title, name).joinToString(" · ")
     }
 
     private fun LocalHostUi.toLanDevice(): LanDevice? {
