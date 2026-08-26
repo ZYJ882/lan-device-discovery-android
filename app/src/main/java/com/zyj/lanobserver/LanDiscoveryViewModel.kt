@@ -105,11 +105,12 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
                     }
 
         )
+        val discoveryNetworkLabel = networkUi.discoveryNetworkLabel()
         scanJob = viewModelScope.launch {
             try {
                 val summary = discoveryEngine.scan(
                     snapshot = snapshot,
-                    onDevicesChanged = { devices -> publishDevices(devices) },
+                    onDevicesChanged = { devices -> publishDevices(devices, discoveryNetworkLabel) },
                     onProgress = { progress ->
                         uiState = uiState.copy(progress = progress)
                     }
@@ -303,13 +304,23 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    private fun publishDevices(devices: List<LanDevice>) {
+    /** 设备归属只记录本次用户明确点击的发现网络，不从地址范围或接口名称反向猜测。 */
+    private fun publishDevices(devices: List<LanDevice>, discoveryNetworkLabel: String) {
+        val taggedDevices = devices.map { device ->
+            device.copy(details = device.details + ("发现网络" to discoveryNetworkLabel))
+        }
         uiState = uiState.copy(
-            devices = devices.sortedWith(
+            devices = taggedDevices.sortedWith(
                 compareByDescending<LanDevice> { it.id.startsWith("local:") }
                     .thenBy { it.displayName.lowercase(Locale.getDefault()) }
             )
         )
+    }
+
+    private fun LanNetworkUi.discoveryNetworkLabel(): String {
+        val name = displayName?.takeIf { it.isNotBlank() }
+        val addressRange = cidr?.takeIf { it.isNotBlank() }
+        return listOfNotNull(title, name, addressRange).joinToString(" · ")
     }
 
     private fun LocalHostUi.toLanDevice(): LanDevice? {

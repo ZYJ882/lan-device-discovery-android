@@ -403,6 +403,19 @@ private fun DeviceCard(device: LanDevice, onClick: () -> Unit) {
                 }
                 Spacer(Modifier.height(3.dp))
                 Text(device.deviceHint, color = LanMuted, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                device.details["发现网络"]?.let { networkLabel ->
+                    Spacer(Modifier.height(6.dp))
+                    Surface(shape = RoundedCornerShape(7.dp), color = LanSky) {
+                        Text(
+                            "网络 · $networkLabel",
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
+                            fontSize = 10.sp,
+                            color = LanBlueDark,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
                 device.details["型号识别证据"]?.let { evidence ->
                     Spacer(Modifier.height(5.dp))
                     Surface(shape = RoundedCornerShape(7.dp), color = Color(0xFFE8F5EE)) {
