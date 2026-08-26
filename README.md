@@ -1,32 +1,50 @@
 # 局域网设备发现（Android）
 
-> 一个使用 **Kotlin、Jetpack Compose 和 Material 3** 构建的原生 Android 应用，用于在受授权的本地网络内发现主动响应的设备，并在用户进入详情后按需读取公开的身份信息。
+> 使用 **Kotlin、Jetpack Compose 与 Material 3** 构建的原生 Android 局域网设备发现工具。它面向自己拥有或明确获授权管理的家庭、办公和测试网络，帮助查看网络状态、发现公开设备证据，并在设备详情中读取公开协议身份信息。
 
-应用包名为 `com.zyj.lanobserver`，最低支持 Android 8.0（API 26），当前以 Android SDK 35 为编译和目标版本。用户主动扫描后，设备列表只保留在内存中；应用不要求账号，也不会上传扫描结果、IP 或 MAC 地址。
+应用包名为 `com.zyj.lanobserver`，最低支持 Android 8.0（API 26），以 Android SDK 35 编译和定位。应用不要求账号；设备列表仅保留在本次运行的内存中，扫描结果、IP 和 MAC 不会上传。
 
-## 2.3.0 主要功能
+## 软件能力
 
-| 功能 | 说明 |
+| 能力 | 说明 |
 |---|---|
-| **IP 与公开服务优先发现** | 首页只合并 ARP/邻居缓存、mDNS/DNS-SD 和 SSDP/UPnP 公开服务证据；不会在首页读取设备 XML 或 IPP 属性 |
-| **详情页“识别型号”** | 仅依据已有 UPnP、IPP、mDNS 或 WS-Discovery 证据发起对应的只读查询；不把 OUI、端口、HTTP `Server` 或 SSDP `SERVER` 作为型号 |
-| **三档识别结论** | 显示“已确认型号”“公开声明型号”“仅识别设备类别”；没有可靠公开字段时明确显示“未能确认型号” |
-| **ONVIF 授权查询** | 已发现 ONVIF / WS-Discovery 地址时，先要求用户输入本次使用的凭据，再发送只读 `GetDeviceInformation`；凭据不保存、不复用 |
-| **OUI 本地厂商辅助** | 首页右上角设置可手动同步 IEEE MA-L、MA-M、MA-S 注册表。最长前缀匹配仅在本机运行；随机/本地管理 MAC 不匹配，OUI 不代表设备厂商或型号 |
-| **实时多网络状态** | 首页分别显示当前实际存在的 Wi‑Fi、个人热点、移动网络、以太网、VPN、蓝牙与其他网络；网络可用、丢失、能力或链路属性变化后自动刷新卡片 |
-| **网络详情** | 点击网络卡片可查看可获得的 IPv4、IPv6、网关、子网掩码、CIDR、DNS、接口、互联网状态与扫描资格；不可获得字段直接隐藏 |
-| **按网络独立扫描** | 每个具备本地 IPv4 边界的 Wi‑Fi、以太网或热点卡片都有“扫描此网络”。扫描使用该卡片对应的 `Network` / `LinkProperties`，不会把多个网段混合扫描，也不使用移动网络或 VPN 作为目标 |
-| **热点下游局域网优先** | 热点打开时优先识别 Soft AP / 网络共享下游 IPv4 接口，即使手机同时保留 Wi‑Fi 上游网络也不会误把发现流量优先发向上游；热点中仍只采用可读邻居缓存与公开服务证据 |
-| **无局域网本机设备** | 没有可扫描的 Wi‑Fi 或热点网络时，本机 IPv4、接口与 CIDR 会作为设备列表中的“本机设备”显示；这不会把蜂窝或链路本地地址变成外部扫描目标 |
-| **VPN 边界** | 可控网络请求绑定实际 Wi‑Fi `Network`，避免 VPN 或代理引发误报 |
+| **多网络状态** | 分别展示系统实际存在的 Wi‑Fi、个人热点、移动网络、以太网、VPN、蓝牙与其他网络，并在网络状态变化后刷新。 |
+| **按网络发现** | 用户从具备本地 IPv4 边界的 Wi‑Fi、以太网或热点卡片启动发现；发现边界与所选网络绑定，不混合多个网段。 |
+| **IP 与公开服务证据** | 合并 ARP / 邻居缓存、mDNS / DNS-SD 与 SSDP / UPnP 公开服务证据，生成可解释、可去重的设备列表。 |
+| **热点下游优先** | 热点开启时优先识别 Soft AP / 网络共享下游 IPv4 接口，避免误将发现流量优先发向 Wi‑Fi 上游或默认移动网络。 |
+| **网络详情** | 查看系统可提供的 IPv4、IPv6、网关、子网掩码、CIDR、DNS、接口、互联网状态与发现资格；不可获得字段自动隐藏。 |
+| **按需型号识别** | 设备详情仅依据已有 UPnP、IPP、mDNS 或 ONVIF / WS-Discovery 证据，执行受限的只读协议查询。 |
+| **可信度分级** | 型号结果明确显示为“已确认型号”“公开声明型号”“仅识别设备类别”或“未能确认型号”。 |
+| **OUI 本地辅助** | 设置中可手动同步 IEEE MA-L、MA-M、MA-S 注册表；最长前缀匹配仅在本机完成，用于网卡注册厂商辅助说明。 |
 
 ## 使用边界
 
-本应用面向**自己拥有或明确获授权管理**的家庭、办公和测试局域网。它不执行默认凭据尝试、不读取远程文件、不运行远程命令、不绕过访问控制，也不提供漏洞探测。普通手机、未广播服务的 IoT 设备以及仅在系统热点客户端表中可见的客户端，普通 Android 应用无法可靠识别具体型号；未显示设备不代表设备未连接。
+应用只在用户主动选择的局域网中读取公开发现证据。它不尝试默认凭据、不绕过访问控制、不读取远程文件、不执行远程命令，也不提供漏洞探测。
 
-> IEEE OUI 仅描述 MAC 前缀的**注册网卡厂商**。它不能确认设备厂商，更不能确认设备型号。完整 MAC 不会上传；扫描期间不会在线查询 OUI。
+普通手机、未广播服务的 IoT 设备，以及仅出现在系统热点客户端表中的设备，普通 Android 应用可能无法获得足够公开证据；未显示设备不代表设备一定未连接。系统限制、客户端隔离、防火墙、设备休眠和 OEM 网络策略都可能影响可见性。
 
-详细的发现流、型号证据等级、ONVIF 凭据边界、OUI 同步、Android 权限与多网络主页实现说明见 [`docs/LAN_DISCOVERY.md`](docs/LAN_DISCOVERY.md)、[`docs/OUI_DATABASE.md`](docs/OUI_DATABASE.md) 与 [`docs/MULTI_NETWORK_IMPLEMENTATION_NOTES.md`](docs/MULTI_NETWORK_IMPLEMENTATION_NOTES.md)。
+> IEEE OUI 仅说明 MAC 前缀的**注册网卡厂商**，不能确认设备厂商或具体型号。对于随机或本地管理 MAC，应用不进行 OUI 匹配；完整 MAC 不会上传，也不会在发现过程中在线查询。
+
+## 使用方式
+
+| 步骤 | 操作 |
+|---|---|
+| 1 | 在首页查看当前网络状态，并选择具备本地 IPv4 的 Wi‑Fi、以太网或个人热点网络。 |
+| 2 | 点击“扫描此网络”，查看由邻居缓存、mDNS 和 SSDP / UPnP 公开证据合并得到的设备。 |
+| 3 | 点击设备，查看 IP、公开服务、来源、可获得的 MAC 与协议公开字段。 |
+| 4 | 如需型号信息，点击“识别型号”；若设备要求 ONVIF 凭据，仅在本次操作中输入。 |
+| 5 | 如需网卡注册厂商辅助信息，在右上角设置中手动同步本地 OUI 数据库。 |
+
+## 文档与版本记录
+
+稳定的发现架构、型号识别边界、OUI 数据库隐私规则和多网络实现说明位于以下文档：
+
+- [`docs/LAN_DISCOVERY.md`](docs/LAN_DISCOVERY.md)：发现流程、网络边界、协议身份识别与权限说明。
+- [`docs/DISCOVERY_ARCHITECTURE.md`](docs/DISCOVERY_ARCHITECTURE.md)：发现来源、去重、热点与诊断架构。
+- [`docs/OUI_DATABASE.md`](docs/OUI_DATABASE.md)：IEEE OUI 数据库、匹配规则和隐私边界。
+- [`docs/MULTI_NETWORK_IMPLEMENTATION_NOTES.md`](docs/MULTI_NETWORK_IMPLEMENTATION_NOTES.md)：多网络状态和按网络发现绑定实现。
+
+每个版本的新增、修改、移除项、安装包校验值与已知边界，统一记录在仓库的 [`GitHub Releases`](https://github.com/ZYJ882/lan-device-discovery-android/releases) 和对应的 `releases/vX.Y.Z/RELEASE_NOTES.md` 中；README 不按版本维护功能清单。
 
 ## 构建与安装
 
@@ -39,23 +57,20 @@ export ANDROID_HOME=/path/to/android-sdk
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Debug APK 位于 `app/build/outputs/apk/debug/app-debug.apk`，采用调试签名，只适合受控测试环境。正式发布前应使用独立 release keystore，并在真实 Wi‑Fi、访客网络、热点和以太网环境中完成权限、网络隔离和兼容性测试。
+Debug APK 位于 `app/build/outputs/apk/debug/app-debug.apk`，采用调试签名，只适合受控测试环境。发布版本会同时在仓库 `releases/` 目录和 [GitHub Releases](https://github.com/ZYJ882/lan-device-discovery-android/releases) 提供源码对应的安装包与发行说明。
 
 ## 工程结构
 
 ```text
 lan-device-discovery-android/
 ├── app/src/main/java/com/zyj/lanobserver/
-│   ├── LanDiscoveryEngine.kt        # 多网络状态与热点下游优先的 IP/公开服务发现引擎
-│   ├── DeviceModelResolver.kt        # 详情页按需 UPnP、IPP、mDNS、ONVIF 识别
-│   ├── OuiDatabase.kt                # 本地 IEEE OUI 同步与最长前缀匹配
-│   ├── LanDiscoveryViewModel.kt      # 扫描、识别与同步状态
-│   └── LanDiscoveryScreen.kt         # 首页、设置和详情界面
-├── docs/
-│   ├── LAN_DISCOVERY.md              # 发现与型号识别边界
-│   ├── MULTI_NETWORK_IMPLEMENTATION_NOTES.md # 多网络状态与扫描绑定说明
-│   └── OUI_DATABASE.md               # IEEE OUI 数据库与隐私说明
-└── releases/                          # 已发布 Debug APK 与发行说明
+│   ├── LanDiscoveryEngine.kt        # 多网络状态与 IP / 公开服务发现引擎
+│   ├── DeviceModelResolver.kt       # 详情页按需 UPnP、IPP、mDNS、ONVIF 识别
+│   ├── OuiDatabase.kt               # 本地 IEEE OUI 同步与最长前缀匹配
+│   ├── LanDiscoveryViewModel.kt     # 网络、发现、识别与同步状态
+│   └── LanDiscoveryScreen.kt        # 首页、设置、网络详情和设备详情界面
+├── docs/                            # 长期架构与使用边界说明
+└── releases/                        # 各版本 APK 与发行说明
 ```
 
 ## 许可证
