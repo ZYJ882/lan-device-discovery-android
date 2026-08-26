@@ -4,7 +4,7 @@
 
 应用包名为 `com.zyj.lanobserver`，最低支持 Android 8.0（API 26），当前以 Android SDK 35 为编译和目标版本。用户主动扫描后，设备列表只保留在内存中；应用不要求账号，也不会上传扫描结果、IP 或 MAC 地址。
 
-## 2.1.0 主要功能
+## 2.1.1 主要功能
 
 | 功能 | 说明 |
 |---|---|
@@ -15,7 +15,10 @@
 | **ONVIF 授权查询** | 已发现 ONVIF / WS-Discovery 地址时，先要求用户输入本次使用的凭据，再发送只读 `GetDeviceInformation`；凭据不保存、不复用 |
 | **OUI 本地厂商辅助** | 首页右上角设置可手动同步 IEEE MA-L、MA-M、MA-S 注册表。最长前缀匹配仅在本机运行；随机/本地管理 MAC 不匹配，OUI 不代表设备厂商或型号 |
 | **前台在线监测** | 仅在应用前台每 15 秒检查一台已发现设备的已知常见服务端口，可主动停止 |
-| **热点与 VPN 边界** | 热点中只采用可读邻居缓存与设备公开服务证据；可控请求绑定实际 Wi‑Fi `Network`，避免 VPN 或代理引发误报 |
+| **热点下游局域网优先** | 热点打开时优先识别 Soft AP / 网络共享下游 IPv4 接口，即使手机同时保留 Wi‑Fi 上游网络也不会误把发现流量优先发向上游；热点中仍只采用可读邻居缓存与公开服务证据 |
+| **无局域网本机状态** | 没有可扫描的 Wi‑Fi 或热点网络时，首页显示本机 IPv4、接口与 CIDR；这不会把蜂窝或链路本地地址变成外部扫描目标 |
+| **本机固定端口检测** | 用户可在无局域网状态下手动检查当前显示的本机 IPv4 的同一 14 个固定常见端口；不检查任何外部地址、端口范围或用户输入目标 |
+| **VPN 边界** | 可控网络请求绑定实际 Wi‑Fi `Network`，避免 VPN 或代理引发误报 |
 
 ## 使用边界
 
@@ -43,10 +46,10 @@ Debug APK 位于 `app/build/outputs/apk/debug/app-debug.apk`，采用调试签�
 ```text
 lan-device-discovery-android/
 ├── app/src/main/java/com/zyj/lanobserver/
-│   ├── LanDiscoveryEngine.kt        # 仅 IP/公开服务发现引擎
+│   ├── LanDiscoveryEngine.kt        # 热点下游优先的 IP/公开服务发现引擎
 │   ├── DeviceModelResolver.kt        # 详情页按需 UPnP、IPP、mDNS、ONVIF 识别
 │   ├── OuiDatabase.kt                # 本地 IEEE OUI 同步与最长前缀匹配
-│   ├── DeviceMonitoringEngine.kt     # 单设备端口扫描与在线检查
+│   ├── DeviceMonitoringEngine.kt     # 单设备与本机固定端口检测、在线检查
 │   ├── LanDiscoveryViewModel.kt      # 扫描、识别与同步状态
 │   └── LanDiscoveryScreen.kt         # 首页、设置和详情界面
 ├── docs/

@@ -85,6 +85,8 @@ fun LanDiscoveryScreen(
     onCancelPortScan: () -> Unit,
     onStartMonitoring: (String) -> Unit,
     onStopMonitoring: () -> Unit,
+    onScanLocalHostPorts: () -> Unit,
+    onCancelLocalHostPortScan: () -> Unit,
     onIdentifyDeviceModel: (String) -> Unit,
     onIdentifyDeviceWithOnvif: (String, String, String) -> Unit,
     onSyncOuiDatabase: () -> Unit
@@ -122,11 +124,15 @@ fun LanDiscoveryScreen(
             item {
                 NetworkOverviewCard(
                     network = state.network,
+                    localHost = state.localHost,
                     isScanning = state.isScanning,
                     progress = state.progress,
+                    localPortScan = state.localPortScan,
                     onStartScan = onStartScan,
                     onCancelScan = onCancelScan,
-                    onRefreshNetwork = onRefreshNetwork
+                    onRefreshNetwork = onRefreshNetwork,
+                    onScanLocalHostPorts = onScanLocalHostPorts,
+                    onCancelLocalHostPortScan = onCancelLocalHostPortScan
                 )
             }
             item {
@@ -183,11 +189,15 @@ fun LanDiscoveryScreen(
 @Composable
 private fun NetworkOverviewCard(
     network: LanNetworkUi?,
+    localHost: LocalHostUi,
     isScanning: Boolean,
     progress: LanScanProgress?,
+    localPortScan: DevicePortScanUiState,
     onStartScan: () -> Unit,
     onCancelScan: () -> Unit,
-    onRefreshNetwork: () -> Unit
+    onRefreshNetwork: () -> Unit,
+    onScanLocalHostPorts: () -> Unit,
+    onCancelLocalHostPortScan: () -> Unit
 ) {
     Card(
         shape = RoundedCornerShape(22.dp),
@@ -210,7 +220,49 @@ private fun NetworkOverviewCard(
             }
             Spacer(Modifier.height(17.dp))
             if (network == null) {
-                Text("请先连接到 Wi‑Fi 或以太网。应用仅在当前局域网内发现设备。", color = LanMuted, fontSize = 14.sp, lineHeight = 20.sp)
+                Text("未检测到可用于设备发现的 Wi‑Fi 或热点局域网。以下仅显示本机接口状态，不会扫描任何外部地址。", color = LanMuted, fontSize = 14.sp, lineHeight = 20.sp)
+                Spacer(Modifier.height(12.dp))
+                NetworkValueRow("本机 IPv4", localHost.localIp ?: "未获取")
+                localHost.interfaceName?.let { NetworkValueRow("本机接口", it) }
+                localHost.cidr?.let { NetworkValueRow("地址范围", it) }
+                Spacer(Modifier.height(5.dp))
+                Surface(color = LanSky, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        localHost.detail,
+                        color = LanMuted,
+                        fontSize = 12.sp,
+                        lineHeight = 17.sp,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                    )
+                }
+                if (localHost.localIp != null) {
+                    Spacer(Modifier.height(14.dp))
+                    HorizontalDivider(color = LanLine)
+                    Spacer(Modifier.height(12.dp))
+                    Text("本机端口检测", color = LanBlueDark, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Text("仅检查本机 IPv4 的 14 个固定常见 TCP 服务端口；不会扫描外部地址、端口范围或发送协议载荷。", color = LanMuted, fontSize = 12.sp, lineHeight = 17.sp)
+                    Spacer(Modifier.height(9.dp))
+                    if (localPortScan.isScanning) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
+                        Spacer(Modifier.height(6.dp))
+                        Text("${localPortScan.message ?: "正在检测"} · ${localPortScan.completedPorts}/${localPortScan.totalPorts}", color = LanMuted, fontSize = 12.sp)
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(onClick = onCancelLocalHostPortScan, modifier = Modifier.fillMaxWidth()) { Text("停止本机端口检测") }
+                    } else {
+                        Button(onClick = onScanLocalHostPorts, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = LanBlue)) {
+                            Text("检测本机 14 个常见端口")
+                        }
+                    }
+                    localPortScan.result?.let { result ->
+                        Spacer(Modifier.height(8.dp))
+                        result.errorMessage?.let { Text(it, color = Color(0xFFB42318), fontSize = 12.sp) }
+                        if (result.errorMessage == null) {
+                            val open = result.openServices.joinToString("、") { "${it.label} (${it.port})" }
+                            Text("本机可建立连接的端口：${open.ifBlank { "未检测到开放的常见服务端口" }}", color = LanMuted, fontSize = 12.sp, lineHeight = 17.sp)
+                        }
+                    }
+                }
                 Spacer(Modifier.height(14.dp))
                 OutlinedButton(onClick = onRefreshNetwork, modifier = Modifier.fillMaxWidth()) { Text("重新检测网络") }
             } else {

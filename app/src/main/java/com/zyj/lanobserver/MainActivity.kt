@@ -38,6 +38,8 @@ class MainActivity : ComponentActivity() {
                     onCancelPortScan = viewModel::cancelPortScan,
                     onStartMonitoring = viewModel::startMonitoring,
                     onStopMonitoring = viewModel::stopMonitoring,
+                    onScanLocalHostPorts = viewModel::scanLocalHostPorts,
+                    onCancelLocalHostPortScan = viewModel::cancelLocalHostPortScan,
                     onIdentifyDeviceModel = viewModel::identifyDeviceModel,
                     onIdentifyDeviceWithOnvif = viewModel::identifyDeviceWithOnvif,
                     onSyncOuiDatabase = viewModel::syncOuiDatabase

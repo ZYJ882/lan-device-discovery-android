@@ -60,14 +60,16 @@ class LanDiscoveryEngine(context: Context) {
             val properties = connectivityManager.getLinkProperties(network) ?: return@mapNotNull null
             snapshotFromWifi(network, properties, vpnPresent, capabilities)
         }
-        return wifiSnapshots.maxByOrNull { snapshot ->
+        // 当本机热点已启用时，优先选择热点下游接口，即使系统同时保留 Wi‑Fi 上游网络。
+        // 这样 Wi‑Fi 共享热点不会误扫上游网络而遗漏连接到手机热点的设备。
+        return hotspotSnapshot(vpnPresent) ?: wifiSnapshots.maxByOrNull { snapshot ->
             val caps = snapshot.network?.let(connectivityManager::getNetworkCapabilities)
             when {
                 caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true -> 3
                 caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true -> 2
                 else -> 1
             }
-        } ?: hotspotSnapshot(vpnPresent)
+        }
     }
 
     private fun snapshotFromWifi(
@@ -99,22 +101,19 @@ class LanDiscoveryEngine(context: Context) {
         )
     }
 
-    /** 仅在未能获取 Wi‑Fi Network 时尝试识别本机热点下游接口；热点没有公开的 Network 句柄。 */
+    /**
+     * 热点下游接口通常不暴露为可绑定的 Android [Network]。因此从本机活动私有 IPv4 接口中识别
+     * Soft AP / USB / 蓝牙网络共享接口，并在发现时优先使用该接口作为热点局域网边界。
+     */
     private fun hotspotSnapshot(vpnPresent: Boolean): LanNetworkSnapshot? {
-        val interfaces = runCatching { NetworkInterface.getNetworkInterfaces() }.getOrNull() ?: return null
-        var candidate: HotspotInterfaceCandidate? = null
-        while (interfaces.hasMoreElements()) {
-            val networkInterface = interfaces.nextElement()
-            if (!runCatching { networkInterface.isUp && !networkInterface.isLoopback }.getOrDefault(false)) continue
-            val name = networkInterface.name.orEmpty().lowercase()
-            if (!(name.contains("softap") || name.startsWith("ap") || name.contains("tether"))) continue
-            val address = networkInterface.interfaceAddresses
-                .firstOrNull { item -> item.address is Inet4Address && item.address.isSiteLocalAddress }
-                ?: continue
-            candidate = HotspotInterfaceCandidate(networkInterface.name, address.address as Inet4Address, address.networkPrefixLength)
-            break
-        }
-        val selected = candidate ?: return null
+        val selected = localIpv4Interfaces()
+            .mapNotNull { record ->
+                hotspotInterfaceScore(record.interfaceName).takeIf { it > 0 }?.let { score -> record to score }
+            }
+            .maxWithOrNull(compareBy<Pair<LocalIpv4Interface, Int>> { it.second }.thenBy { !it.first.address.isLinkLocalAddress })
+            ?.first
+            ?.let { record -> HotspotInterfaceCandidate(record.interfaceName, record.address, record.prefixLength) }
+            ?: return null
         val subnet = Ipv4Subnet.from(selected.address, selected.prefixLength.toInt())
         return LanNetworkSnapshot(
             network = null,
@@ -128,6 +127,57 @@ class LanDiscoveryEngine(context: Context) {
             isHotspot = true,
             hasVpn = vpnPresent
         )
+    }
+
+    /**
+     * 没有可扫描的 Wi‑Fi 或热点局域网时，用于界面展示本机仍可见的 IPv4 接口。
+     * 该信息不会被当作发现网络，也不会触发任何后台扫描。
+     */
+    fun localHostInfo(): LocalHostInfo {
+        val candidate = localIpv4Interfaces()
+            .maxWithOrNull(compareBy<LocalIpv4Interface> { localInterfaceScore(it.interfaceName) }.thenBy { !it.address.isLinkLocalAddress })
+            ?: return LocalHostInfo(null, null, null, "未检测到可用的本机 IPv4 接口")
+        return LocalHostInfo(
+            localIp = candidate.address.hostAddress,
+            interfaceName = candidate.interfaceName,
+            cidr = Ipv4Subnet.from(candidate.address, candidate.prefixLength.toInt()).cidrLabel,
+            detail = if (candidate.address.isLinkLocalAddress) "当前仅有自分配 IPv4 地址；无法据此发现局域网设备。" else "该地址仅用于展示本机网络状态；未作为局域网扫描目标。"
+        )
+    }
+
+    private fun localIpv4Interfaces(): List<LocalIpv4Interface> {
+        val interfaces = runCatching { NetworkInterface.getNetworkInterfaces() }.getOrNull() ?: return emptyList()
+        val result = mutableListOf<LocalIpv4Interface>()
+        while (interfaces.hasMoreElements()) {
+            val networkInterface = interfaces.nextElement()
+            if (!runCatching { networkInterface.isUp && !networkInterface.isLoopback && !networkInterface.isVirtual }.getOrDefault(false)) continue
+            networkInterface.interfaceAddresses
+                .filter { item -> item.address is Inet4Address && !item.address.isLoopbackAddress }
+                .forEach { item -> result += LocalIpv4Interface(networkInterface.name.orEmpty(), item.address as Inet4Address, item.networkPrefixLength) }
+        }
+        return result
+    }
+
+    private fun hotspotInterfaceScore(interfaceName: String): Int {
+        val name = interfaceName.lowercase()
+        return when {
+            name.contains("softap") -> 100
+            name == "ap0" || name.startsWith("ap_") || name.startsWith("ap") -> 95
+            name.contains("tether") -> 90
+            name.contains("rndis") || name.contains("usb") -> 80
+            name.contains("bt-pan") || name.contains("bnep") -> 70
+            else -> 0
+        }
+    }
+
+    private fun localInterfaceScore(interfaceName: String): Int {
+        val name = interfaceName.lowercase()
+        return when {
+            hotspotInterfaceScore(interfaceName) > 0 -> 100
+            name.startsWith("wlan") || name.startsWith("eth") -> 80
+            name.startsWith("rmnet") || name.startsWith("ccmni") || name.startsWith("pdp") -> 60
+            else -> 20
+        }
     }
 
     suspend fun scan(
@@ -364,7 +414,8 @@ class LanDiscoveryEngine(context: Context) {
         runCatching {
             DatagramSocket(null).use { socket ->
                 socket.reuseAddress = true
-                socket.bind(InetSocketAddress(0))
+                val localBindAddress = if (snapshot.isHotspot) InetAddress.getByName(snapshot.localIp) else null
+                socket.bind(InetSocketAddress(localBindAddress, 0))
                 snapshot.network?.bindSocket(socket)
                 socket.soTimeout = SSDP_RECEIVE_TIMEOUT_MILLIS
                 socket.send(DatagramPacket(request, request.size, InetAddress.getByName(SSDP_ADDRESS), SSDP_PORT))
@@ -569,6 +620,14 @@ data class LanScanSummary(
 )
 
 private data class HotspotInterfaceCandidate(val interfaceName: String, val address: Inet4Address, val prefixLength: Short)
+private data class LocalIpv4Interface(val interfaceName: String, val address: Inet4Address, val prefixLength: Short)
+
+data class LocalHostInfo(
+    val localIp: String?,
+    val interfaceName: String?,
+    val cidr: String?,
+    val detail: String
+)
 private data class NeighborRead(val cacheReadable: Boolean, val entries: List<NeighborEntry>)
 private data class NeighborEntry(val ipAddress: String, val macAddress: String, val interfaceName: String) {
     fun toLanDevice(timestamp: Long) = LanDevice(

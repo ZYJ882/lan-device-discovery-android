@@ -48,6 +48,36 @@ class DeviceMonitoringEngine {
         )
     }
 
+    /**
+     * 仅用于无可扫描局域网时用户主动检查本机 IPv4。目标来自本机接口枚举，
+     * 固定复用同一 14 端口清单，不接受用户输入的远程地址。
+     */
+    suspend fun scanLocalHostPorts(
+        localIp: String,
+        onProgress: (completed: Int, total: Int) -> Unit
+    ): DevicePortScanResult = coroutineScope {
+        val address = runCatching { InetAddress.getByName(localIp) as? Inet4Address }.getOrNull()
+            ?: return@coroutineScope DevicePortScanResult.invalidAddress(localIp)
+        val progress = AtomicInteger(0)
+        val semaphore = Semaphore(SCAN_CONCURRENCY)
+        val openPorts = PORT_PROFILE.map { service ->
+            async(Dispatchers.IO) {
+                semaphore.withPermit {
+                    val isOpen = isTcpPortOpen(null, address, service.port, PORT_SCAN_TIMEOUT_MILLIS)
+                    onProgress(progress.incrementAndGet(), PORT_PROFILE.size)
+                    service.takeIf { isOpen }
+                }
+            }
+        }.awaitAll().filterNotNull()
+        DevicePortScanResult(
+            targetIp = address.hostAddress.orEmpty(),
+            checkedServices = PORT_PROFILE,
+            openServices = openPorts,
+            completedAt = System.currentTimeMillis(),
+            errorMessage = null
+        )
+    }
+
     suspend fun checkOnline(device: LanDevice, network: Network?): DeviceOnlineResult = withContext(Dispatchers.IO) {
         val address = device.primaryIpv4Address()
             ?: return@withContext DeviceOnlineResult.invalidTarget()
@@ -121,8 +151,10 @@ data class DevicePortScanResult(
     val errorMessage: String?
 ) {
     companion object {
-        fun invalidTarget(device: LanDevice) = DevicePortScanResult(
-            targetIp = device.addresses.firstOrNull().orEmpty(),
+        fun invalidTarget(device: LanDevice) = invalidAddress(device.addresses.firstOrNull().orEmpty())
+
+        fun invalidAddress(address: String) = DevicePortScanResult(
+            targetIp = address,
             checkedServices = emptyList(),
             openServices = emptyList(),
             completedAt = System.currentTimeMillis(),
