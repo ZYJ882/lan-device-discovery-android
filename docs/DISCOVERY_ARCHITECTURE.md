@@ -1,49 +1,33 @@
-# 多发现源局域网设备发现架构
+# 设备发现架构
 
-## 设计目标
+## 设计原则
 
-扫描的目标不是把 `/24` 中的地址数量包装为设备数量，而是在明确选定的 Wi‑Fi `Network` 上收集多个相互独立的设备证据，并将这些证据合并为可解释的设备记录。每个设备都必须保留来源和原始协议字段，便于在 Logcat 中解释它为什么出现、如何命名以及是否可能重复。
+应用只收集能够直接证明设备 IP 或公开服务存在的只读证据。发现模块不建立 TCP 端口连通性检查；设备详情只提供公开协议元数据的按需识别与本地 OUI 辅助信息。
 
-## 网络上下文
+## 多网络边界
 
-`WifiNetworkContext` 由 `ConnectivityManager.getAllNetworks()` 选择具备 `TRANSPORT_WIFI`、有效 IPv4 `LinkProperties` 和本地路由的实际 Wi‑Fi 网络。它保留 `Network`、接口名、本机 IPv4、网关、实际 CIDR、扫描 CIDR 和 VPN 是否存在。所有可控制的网络操作都使用此 `Network`：
+主页列出系统实际存在的 Wi‑Fi、个人热点、移动网络、以太网、VPN、蓝牙和其他网络。只有用户明确点击的 Wi‑Fi、以太网或热点网络会进入发现引擎；移动网络和 VPN 只用于状态展示。
 
-| 操作 | 绑定方式 |
-|---|---|
-| SSDP UDP | 新建未连接 `DatagramSocket` 后调用 `wifiNetwork.bindSocket(socket)` |
-| 单设备端口扫描 | 用户在设备详情明确触发后，新建未连接 `Socket` 并调用 `wifiNetwork.bindSocket(socket)` |
-| UPnP 描述 XML | `wifiNetwork.openConnection(url)` |
-| IP 地址解析 | 对本地发现的响应地址直接使用；不通过默认网络 DNS 解析 |
-| Android NSD/mDNS | 使用系统 `NsdManager` 和 Wi-Fi `MulticastLock`；Android 11（API 30）及以上使用携带 Wi-Fi `Network` 的 `discoverServices` 重载，较低版本使用系统 DNS-SD 发现并记录请求、找到、解析和失败计数。 |
+| 网络场景 | 边界来源 | 发现流量 |
+|---|---|---|
+| Wi‑Fi / 以太网 | 对应的 `Network`、`LinkProperties`、IPv4 地址与 CIDR | mDNS 使用系统 NSD；SSDP 与后续受限读取绑定对应 `Network` |
+| 个人热点 | Soft AP / tether 下游接口与 IPv4 地址 | SSDP 绑定热点本机 IPv4；读取同子网邻居缓存；mDNS 依赖系统 NSD 的可见性 |
+| 移动网络 / VPN | 系统网络状态 | 不作为局域网发现目标 |
 
-## 发现源
+## 发现证据
 
-| 来源 | 证据等级 | 设备键 | 可获得字段 |
-|---|---:|---|---|
-| 本机 Wi‑Fi 邻居缓存 | 中 | IPv4、MAC | IPv4、MAC、接口 |
-| mDNS / DNS-SD | 高 | IPv4、服务实例、服务类型、hostname | IP、hostname、服务、TXT、厂商、型号 |
-| SSDP / UPnP | 高 | IPv4、USN/UDN、LOCATION | USN、SERVER、ST、CACHE-CONTROL、XML 设备信息 |
-| UPnP 描述 XML | 很高 | UDN、serialNumber、IPv4 | friendlyName、厂商、型号、设备类型、序列号 |
-| 单设备端口扫描 | 用户触发 | 已发现设备的 IPv4 | 已响应端口和服务特征；不参与默认设备发现 |
+| 来源 | 收集内容 | 作用 |
+|---|---|---|
+| 邻居 / ARP 缓存 | IP、MAC、接口 | 仅作为系统实际可读的邻居证据，不代表完整 DHCP 或热点客户端表 |
+| mDNS / DNS-SD | 服务类型、主机、公开 TXT 字段 | 发现公开服务，并为后续公开型号声明提供证据 |
+| SSDP / UPnP | `ST`、`USN`、`LOCATION`、`SERVER` | 发现 UPnP 服务并为详情页受限设备描述读取保存线索 |
 
-## 统一设备模型与去重
+`SERVER`、`ST`、`USN`、服务类别和 OUI 都不会直接作为设备名称或具体型号。设备名称优先使用 UPnP `friendlyName`、mDNS 主机名或协议公开厂商/型号字段；没有可靠公开名称时显示“未知设备”。
 
-每个来源首先产生 `DeviceObservation`，其中的身份别名包括 IPv4、MAC、mDNS service identity、UPnP USN、UPnP UDN 和 serialNumber。`DeviceRegistry` 维护这些别名到稳定内部设备 ID 的索引；任何一个别名命中时合并记录，多别名命中时合并所有关联记录。IPv4 永远不是唯一的长期身份，但它是本次扫描的首选连接键。
+## 详情页型号识别
 
-冲突合并时，用户可见名称必须按证据优先级选择，而不是按到达顺序选择：
+设备详情的“识别型号”只会依据已有 UPnP、IPP、mDNS 或 ONVIF / WS-Discovery 线索发起协议特定只读查询。ONVIF 必须由用户输入本次凭据；凭据不保存。结论固定为“已确认型号”“公开声明型号”“仅识别设备类别”或“未能确认型号”。
 
-1. UPnP `friendlyName`；
-2. mDNS hostname；
-3. DHCP hostname（仅系统可用时）；
-4. `manufacturer + modelName`；
-5. UPnP `manufacturer + modelName`；
-6. 厂商 + deviceType；
-7. `未知设备`。
+## 去重与诊断
 
-`SERVER`、`ST`、`USN`、端口扫描结果和服务推测只能进入详情/日志，不能作为名称。无 XML 身份信息的 SSDP 响应默认名称是“未知设备”，设备类型可从 `ST` 作为辅助提示。
-
-## 扫描诊断
-
-`DiscoveryDiagnostics` 在每次默认发现中记录以下内容并使用 `Log.i("LanDiscovery")` 输出：Wi‑Fi Network、接口、IPv4、CIDR、网关、VPN、多播锁状态；ARP、mDNS 与 SSDP 的请求、原始响应、解析成功和失败数量；默认端口检查数（固定为零）；原始观察数和最终去重设备数。每条设备日志输出 IP、可得 MAC、hostname、mDNS 身份、SSDP USN/SERVER、UPnP 字段、端口和全部来源。端口字段仅可来自设备公开服务或用户手动启动的单设备扫描。
-
-应用页面仅沿用既有来源标签和详情字段；本次重构不更改视觉布局。
+`DeviceRegistry` 以 IP、MAC、UPnP UDN / USN 与 mDNS 服务线索合并同一设备。`DiscoveryDiagnostics` 使用 `LanDiscovery` 日志标签记录选定网络、接口、IPv4、CIDR、网关、VPN、多播锁、ARP、mDNS、SSDP 的原始观察与最终去重数量，便于解释设备可见性差异。

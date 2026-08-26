@@ -48,12 +48,6 @@ class MainActivity : ComponentActivity() {
                     onRefreshNetwork = viewModel::refreshNetwork,
                     onFilter = viewModel::filter,
                     onSelectDevice = viewModel::selectDevice,
-                    onScanDevicePorts = viewModel::scanDevicePorts,
-                    onCancelPortScan = viewModel::cancelPortScan,
-                    onStartMonitoring = viewModel::startMonitoring,
-                    onStopMonitoring = viewModel::stopMonitoring,
-                    onScanLocalHostPorts = viewModel::scanLocalHostPorts,
-                    onCancelLocalHostPortScan = viewModel::cancelLocalHostPortScan,
                     onIdentifyDeviceModel = viewModel::identifyDeviceModel,
                     onIdentifyDeviceWithOnvif = viewModel::identifyDeviceWithOnvif,
                     onSyncOuiDatabase = viewModel::syncOuiDatabase

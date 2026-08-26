@@ -38,8 +38,8 @@ import kotlin.coroutines.resume
 /**
  * 只读、多发现源的局域网设备发现引擎。
  *
- * 默认发现不扫描 TCP 端口；结果仅来自 ARP/邻居、mDNS、SSDP/UPnP 等可直接提供设备 IP 的证据。
- * 端口扫描只在用户进入一台已发现设备详情后手动执行。所有可控的网络请求均绑定到明确选择的 Wi‑Fi Network。
+ * 结果仅来自 ARP/邻居、mDNS、SSDP/UPnP 等可直接提供设备 IP 的证据；不会发起 TCP 端口连通性检查。
+ * 所有可控的网络请求均绑定到明确选择的局域网 Network，避免误走 VPN 或系统默认网络。
  */
 class LanDiscoveryEngine(context: Context) {
     private val appContext = context.applicationContext

@@ -13,8 +13,6 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.DateFormat
@@ -23,14 +21,10 @@ import java.util.Locale
 
 class LanDiscoveryViewModel(application: Application) : AndroidViewModel(application) {
     private val discoveryEngine = LanDiscoveryEngine(application)
-    private val monitoringEngine = DeviceMonitoringEngine()
     private val modelResolver = DeviceModelResolver()
     private val ouiDatabase = OuiDatabase(application)
     private val connectivityManager = application.getSystemService(ConnectivityManager::class.java)
     private var scanJob: Job? = null
-    private var portScanJob: Job? = null
-    private var monitorJob: Job? = null
-    private var localPortScanJob: Job? = null
     private var modelRecognitionJob: Job? = null
     private var ouiSyncJob: Job? = null
 
@@ -95,9 +89,6 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
             uiState = uiState.copy(message = "该网络仅用于状态展示，不支持局域网设备扫描。")
             return
         }
-        stopMonitoring()
-        portScanJob?.cancel()
-        localPortScanJob?.cancel()
         uiState = uiState.copy(
             network = networkUi,
             selectedNetworkId = networkUi.id,
@@ -106,13 +97,12 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
             selectedDeviceId = null,
             progress = LanScanProgress("正在准备 IP 与公开服务发现", 0, 0),
             lastScanLabel = null,
-            portScanStates = emptyMap(),
-            onlineStates = emptyMap(),
-            message = if (snapshot.isHotspot) {
-                "正在从热点子网 ${snapshot.scanCidr} 的邻居缓存、mDNS 与 UPnP 识别设备 IP；不会扫描端口。"
-            } else {
-                "正在发现 ${snapshot.actualCidr} 中公开广播的设备 IP；不会扫描端口、发送登录请求、读取文件或执行远程命令。"
-            }
+                                message = if (snapshot.isHotspot) {
+                        "正在从热点子网 ${snapshot.scanCidr} 的邻居缓存、mDNS 与 UPnP 识别设备 IP。"
+                    } else {
+                        "正在发现 ${snapshot.actualCidr} 中公开广播的设备 IP；不会发送登录请求、读取文件或执行远程命令。"
+                    }
+
         )
         scanJob = viewModelScope.launch {
             try {
@@ -140,7 +130,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
                         val arp = summary.diagnostics.sourceStats["ARP"]?.observations ?: 0
                         val mdns = summary.diagnostics.sourceStats["mDNS"]?.observations ?: 0
                         val ssdp = summary.diagnostics.sourceStats["SSDP"]?.observations ?: 0
-                        "扫描完成：多源原始证据 ARP $arp、mDNS $mdns、SSDP $ssdp；去重后 ${summary.discoveredCount} 台。默认扫描未检查任何 TCP/UDP 端口；请选择已发现设备后手动扫描可用端口。"
+                        "扫描完成：多源原始证据 ARP $arp、mDNS $mdns、SSDP $ssdp；去重后 ${summary.discoveredCount} 台。结果仅来自邻居缓存与公开服务证据。"
                     }
                 )
             } catch (exception: SecurityException) {
@@ -170,138 +160,6 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
             progress = null,
             message = "已停止扫描。当前已发现的设备仍会保留在列表中。"
         )
-    }
-
-    /** 只允许对当前已发现设备的固定常见服务端口进行扫描。 */
-    fun scanDevicePorts(deviceId: String) {
-        val device = uiState.devices.firstOrNull { it.id == deviceId } ?: return
-        if (portScanJob?.isActive == true) return
-        updatePortScan(deviceId) {
-            DevicePortScanUiState(
-                isScanning = true,
-                completedPorts = 0,
-                totalPorts = DeviceMonitoringEngine.PORT_PROFILE.size,
-                result = null,
-                message = "正在检查固定的常见服务端口"
-            )
-        }
-        portScanJob = viewModelScope.launch {
-            try {
-                val result = monitoringEngine.scanCommonPorts(
-                    device = device,
-                    network = uiState.network?.scanSnapshot?.network
-                ) { completed, total ->
-                    viewModelScope.launch {
-                        updatePortScan(deviceId) { current ->
-                            current.copy(completedPorts = completed, totalPorts = total)
-                        }
-                    }
-                }
-                updatePortScan(deviceId) {
-                    DevicePortScanUiState(
-                        isScanning = false,
-                        completedPorts = result.checkedServices.size,
-                        totalPorts = result.checkedServices.size,
-                        result = result,
-                        message = result.errorMessage ?: "端口扫描完成"
-                    )
-                }
-            } catch (exception: CancellationException) {
-                updatePortScan(deviceId) { current -> current.copy(isScanning = false, message = "端口扫描已停止") }
-                throw exception
-            } catch (exception: Exception) {
-                updatePortScan(deviceId) {
-                    it.copy(isScanning = false, message = "端口扫描失败：${exception.message ?: "网络暂不可用"}")
-                }
-            }
-        }
-    }
-
-    fun cancelPortScan() {
-        portScanJob?.cancel()
-        portScanJob = null
-    }
-
-    /** 无可扫描局域网时，用户可主动检测当前显示的本机 IPv4 固定常见端口。 */
-    fun scanLocalHostPorts() {
-        val localIp = uiState.localHost.localIp ?: run {
-            uiState = uiState.copy(localPortScan = DevicePortScanUiState(message = "未获取到可检测的本机 IPv4 地址"))
-            return
-        }
-        if (localPortScanJob?.isActive == true) return
-        uiState = uiState.copy(
-            localPortScan = DevicePortScanUiState(
-                isScanning = true,
-                completedPorts = 0,
-                totalPorts = DeviceMonitoringEngine.PORT_PROFILE.size,
-                message = "正在检查本机固定的常见服务端口"
-            )
-        )
-        localPortScanJob = viewModelScope.launch {
-            try {
-                val result = monitoringEngine.scanLocalHostPorts(localIp) { completed, total ->
-                    viewModelScope.launch {
-                        uiState = uiState.copy(localPortScan = uiState.localPortScan.copy(completedPorts = completed, totalPorts = total))
-                    }
-                }
-                uiState = uiState.copy(
-                    localPortScan = DevicePortScanUiState(
-                        isScanning = false,
-                        completedPorts = result.checkedServices.size,
-                        totalPorts = result.checkedServices.size,
-                        result = result,
-                        message = result.errorMessage ?: "本机端口检测完成"
-                    )
-                )
-            } catch (exception: CancellationException) {
-                uiState = uiState.copy(localPortScan = uiState.localPortScan.copy(isScanning = false, message = "本机端口检测已停止"))
-                throw exception
-            } catch (exception: Exception) {
-                uiState = uiState.copy(
-                    localPortScan = uiState.localPortScan.copy(
-                        isScanning = false,
-                        message = "本机端口检测失败：${exception.message ?: "网络暂不可用"}"
-                    )
-                )
-            }
-        }
-    }
-
-    fun cancelLocalHostPortScan() {
-        localPortScanJob?.cancel()
-        localPortScanJob = null
-    }
-
-    /** 在应用前台中每 15 秒检查一次指定已发现设备的常见服务端口。 */
-    fun startMonitoring(deviceId: String) {
-        if (uiState.monitoredDeviceId == deviceId && monitorJob?.isActive == true) return
-        monitorJob?.cancel()
-        uiState = uiState.copy(monitoredDeviceId = deviceId)
-        monitorJob = viewModelScope.launch {
-            while (isActive) {
-                val device = uiState.devices.firstOrNull { it.id == deviceId } ?: break
-                val result = try {
-                    monitoringEngine.checkOnline(device, uiState.network?.scanSnapshot?.network)
-                } catch (exception: CancellationException) {
-                    throw exception
-                } catch (exception: Exception) {
-                    DeviceOnlineResult(
-                        status = DeviceOnlineStatus.Unconfirmed,
-                        checkedAt = System.currentTimeMillis(),
-                        responsivePort = null,
-                        detail = "检查失败：${exception.message ?: "网络暂不可用"}"
-                    )
-                }
-                uiState = uiState.copy(onlineStates = uiState.onlineStates + (deviceId to result))
-                delay(DeviceMonitoringEngine.MONITOR_INTERVAL_MILLIS)
-            }
-        }
-    }
-
-    fun stopMonitoring() {
-        monitorJob?.cancel()
-        monitorJob = null
-        uiState = uiState.copy(monitoredDeviceId = null)
     }
 
     fun selectDevice(deviceId: String?) {
@@ -376,18 +234,10 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
 
     override fun onCleared() {
         scanJob?.cancel()
-        portScanJob?.cancel()
-        monitorJob?.cancel()
-        localPortScanJob?.cancel()
         modelRecognitionJob?.cancel()
         ouiSyncJob?.cancel()
         runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
         super.onCleared()
-    }
-
-    private fun updatePortScan(deviceId: String, transform: (DevicePortScanUiState) -> DevicePortScanUiState) {
-        val current = uiState.portScanStates[deviceId] ?: DevicePortScanUiState()
-        uiState = uiState.copy(portScanStates = uiState.portScanStates + (deviceId to transform(current)))
     }
 
     private fun updateModelRecognition(deviceId: String, transform: (ModelRecognitionUiState) -> ModelRecognitionUiState) {
@@ -474,7 +324,6 @@ data class LanDiscoveryUiState(
     val selectedNetworkId: String? = null,
     val scannedDeviceCounts: Map<String, Int> = emptyMap(),
     val localHost: LocalHostUi = LocalHostUi(),
-    val localPortScan: DevicePortScanUiState = DevicePortScanUiState(),
     val isScanning: Boolean = false,
     val progress: LanScanProgress? = null,
     val devices: List<LanDevice> = emptyList(),
@@ -482,9 +331,6 @@ data class LanDiscoveryUiState(
     val searchQuery: String = "",
     val lastScanLabel: String? = null,
     val message: String = "正在读取网络状态。",
-    val portScanStates: Map<String, DevicePortScanUiState> = emptyMap(),
-    val onlineStates: Map<String, DeviceOnlineResult> = emptyMap(),
-    val monitoredDeviceId: String? = null,
     val modelRecognitionStates: Map<String, ModelRecognitionUiState> = emptyMap(),
     val ouiDatabaseStatus: OuiDatabaseStatus = OuiDatabaseStatus(false, 0, null, "尚未同步"),
     val isOuiSyncing: Boolean = false,
@@ -510,14 +356,6 @@ data class LanDiscoveryUiState(
     val selectedDevice: LanDevice?
         get() = devices.firstOrNull { it.id == selectedDeviceId }
 }
-
-data class DevicePortScanUiState(
-    val isScanning: Boolean = false,
-    val completedPorts: Int = 0,
-    val totalPorts: Int = 0,
-    val result: DevicePortScanResult? = null,
-    val message: String? = null
-)
 
 data class LocalHostUi(
     val localIp: String? = null,

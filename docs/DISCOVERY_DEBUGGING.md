@@ -2,7 +2,7 @@
 
 ## 适用版本
 
-本说明对应多发现源重构版本。主页默认扫描不把 IPv4 子网中“可检查地址”的数量当成设备数量，也不会建立端口连接；它只记录 ARP/邻居、mDNS 和 SSDP/UPnP 的原始证据，再输出统一去重后的设备列表。端口检查仅在用户从详情页主动对一台已发现设备发起时执行。
+本说明对应当前多发现源版本。扫描不把 IPv4 子网中“可检查地址”的数量当成设备数量，也不会建立 TCP 或 UDP 端口连通性检查；它只记录 ARP/邻居、mDNS 和 SSDP/UPnP 的原始证据，再输出统一去重后的设备列表。
 
 ## 获取扫描日志
 
@@ -25,8 +25,8 @@ adb logcat -s LanDiscovery:I '*:S'
 | `source.response name=mDNS` | 每个 mDNS 服务类型发现的服务实例 | 仅代表服务广播，不是所有客户端 |
 | `source.response name=SSDP` | SSDP 响应、USN、ST | 至少有响应时应随后见到 `upnpXml` 或明确 XML 请求失败原因 |
 | `source.failure` | 发现启动、解析、网络或权限失败 | 用于区分权限、网络绑定和设备无响应 |
-| `device.publish` | 去重后的设备状态 | 核对 IP、MAC、mDNS、SSDP USN/SERVER、UPnP 字段、端口和来源 |
-| `scan.finish` | 原始证据数、去重设备数、默认端口检查数和总耗时 | 默认端口检查数必须为零；对比不同网络或其他工具时的主要依据 |
+| `device.publish` | 去重后的设备状态 | 核对 IP、MAC、mDNS、SSDP USN/SERVER、UPnP 字段和来源 |
+| `scan.finish` | 原始证据数、去重设备数和总耗时 | 对比不同网络或其他工具时的主要依据 |
 
 ## 验证步骤
 
