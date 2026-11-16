@@ -34,7 +34,7 @@ jobs:
           set -euo pipefail
           mkdir -p release
           cp app/build/outputs/apk/debug/app-debug.apk "release/lan-device-discovery-${GITHUB_REF_NAME}-debug.apk"
-          git archive --format=zip --prefix="lan-device-discovery-android-${GITHUB_REF_NAME}/" HEAD \
+          git archive --format=zip --output="lan-device-discovery-android-${GITHUB_REF_NAME}.zip" --prefix="lan-device-discovery-android-${GITHUB_REF_NAME}/" HEAD \
             -- ':!releases/*/*.apk' ':!*.zip' ':!*.sha256'
           mv "lan-device-discovery-android-${GITHUB_REF_NAME}.zip" "release/lan-device-discovery-${GITHUB_REF_NAME}-source-clean.zip"
           sha256sum release/* > release/SHA256SUMS.txt
