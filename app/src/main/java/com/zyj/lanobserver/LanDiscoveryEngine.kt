@@ -17,12 +17,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -32,6 +37,7 @@ import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 
@@ -356,11 +362,16 @@ class LanDiscoveryEngine(context: Context) {
         val startedAt = System.currentTimeMillis()
         val diagnostics = DiscoveryDiagnostics(snapshot)
         diagnostics.scanStarted()
-        val registry = DeviceRegistry({ devices -> mainHandler.post { onDevicesChanged(devices) } }, diagnostics)
+        val registry = DeviceRegistry({ devices -> mainHandler.post { onDevicesChanged(devices) } }, diagnostics, mainHandler)
         registry.upsert(localDevice(snapshot, startedAt))
 
-        val neighborRead = readNeighbors(snapshot, diagnostics)
-        neighborRead.entries.forEach { registry.upsert(it.toLanDevice(startedAt)) }
+        // 第一次邻居读取：提供扫描开始前已经存在的 ARP 证据。文件读取放到 IO 线程，不阻塞主线程。
+        val firstNeighborRead = withContext(Dispatchers.IO) { readNeighbors(snapshot, diagnostics) }
+        val neighborIps = mutableSetOf<String>()
+        firstNeighborRead.entries.forEach { entry ->
+            neighborIps += entry.ipAddress
+            registry.upsert(entry.toLanDevice(startedAt))
+        }
 
         val multicastLock = acquireMulticastLock()
         diagnostics.multicastLock(multicastLock?.isHeld == true)
@@ -372,10 +383,36 @@ class LanDiscoveryEngine(context: Context) {
                     totalHosts = 0
                 )
             )
-            val mdns = async(Dispatchers.IO) { discoverMdns(snapshot, registry, diagnostics, this@coroutineScope) }
+            val resolvePipeline = MdnsResolvePipeline(registry, diagnostics, this).also {
+                it.startBudget(MDNS_RESOLVE_BUDGET_MILLIS)
+            }
+            val mdns = async(Dispatchers.IO) { discoverMdns(snapshot, diagnostics, resolvePipeline) }
             val ssdp = async(Dispatchers.IO) { discoverSsdp(snapshot, registry, diagnostics) }
             awaitAll(mdns, ssdp)
+
+            // 第二次邻居读取：mDNS / SSDP 组播流量会补全内核 ARP 缓存，此时能捕获扫描开始前不可见的邻居，
+            // 并把 MAC 证据合并到已由协议证据发现的设备上。
+            val secondNeighborRead = withContext(Dispatchers.IO) { readNeighbors(snapshot, diagnostics, secondPass = true) }
+            var refreshedNeighbors = 0
+            secondNeighborRead.entries.forEach { entry ->
+                neighborIps += entry.ipAddress
+                if (!registry.hasNeighborEntry(entry.ipAddress, entry.macAddress)) {
+                    refreshedNeighbors += 1
+                    registry.upsert(entry.toLanDevice(startedAt))
+                }
+            }
+            if (secondNeighborRead.cacheReadable) {
+                diagnostics.neighborCacheRefresh(secondNeighborRead.entries.size, refreshedNeighbors)
+            }
+
+            // 等待仍在排队的 mDNS 解析收尾（受总预算约束），确保完成统计与设备列表一致。
+            resolvePipeline.awaitCompletion()
+            registry.publishNow()
+
             val finalDevices = registry.snapshot()
+            val publicServiceDeviceCount = finalDevices.count { device ->
+                device.sources.any { it == "mDNS / DNS-SD" || it == "SSDP / UPnP" }
+            }
             val finalDiagnostics = diagnostics.finish(
                 rawObservations = registry.rawObservationCount(),
                 deduplicatedDevices = finalDevices.size,
@@ -386,8 +423,9 @@ class LanDiscoveryEngine(context: Context) {
                 finishedAt = System.currentTimeMillis(),
                 discoveredCount = finalDevices.size,
                 scannedHostCount = 0,
-                hotspotNeighborCount = if (snapshot.isHotspot) neighborRead.entries.size else 0,
-                hotspotNeighborCacheReadable = neighborRead.cacheReadable,
+                hotspotNeighborCount = if (snapshot.isHotspot) neighborIps.size else 0,
+                hotspotNeighborCacheReadable = firstNeighborRead.cacheReadable || secondNeighborRead.cacheReadable,
+                publicServiceDeviceCount = publicServiceDeviceCount,
                 diagnostics = finalDiagnostics
             )
         } finally {
@@ -413,11 +451,18 @@ class LanDiscoveryEngine(context: Context) {
         lastSeenAt = timestamp
     )
 
-    /** 只读当前接口的 ARP 邻居缓存。受平台限制时记录失败，不伪造设备。 */
-    private fun readNeighbors(snapshot: LanNetworkSnapshot, diagnostics: DiscoveryDiagnostics): NeighborRead {
+    /**
+     * 只读当前接口的 ARP 邻居缓存。受平台限制时记录失败，不伪造设备。
+     * [secondPass] 为组播阶段结束后的补读：只返回条目，不重复记录源状态与统计。
+     */
+    private fun readNeighbors(
+        snapshot: LanNetworkSnapshot,
+        diagnostics: DiscoveryDiagnostics,
+        secondPass: Boolean = false
+    ): NeighborRead {
         val arp = File("/proc/net/arp")
         if (!arp.canRead()) {
-            diagnostics.neighborCache(false, 0)
+            if (!secondPass) diagnostics.neighborCache(false, 0)
             return NeighborRead(false, emptyList())
         }
         return runCatching {
@@ -433,10 +478,10 @@ class LanDiscoveryEngine(context: Context) {
                     NeighborEntry(ip.hostAddress.orEmpty(), mac.lowercase(), interfaceName)
                 }.distinctBy { it.ipAddress }.toList()
             }
-            diagnostics.neighborCache(true, entries.size)
+            if (!secondPass) diagnostics.neighborCache(true, entries.size)
             NeighborRead(true, entries)
         }.getOrElse {
-            diagnostics.neighborCache(false, 0)
+            if (!secondPass) diagnostics.neighborCache(false, 0)
             NeighborRead(false, emptyList())
         }
     }
@@ -450,15 +495,13 @@ class LanDiscoveryEngine(context: Context) {
 
     private suspend fun discoverMdns(
         snapshot: LanNetworkSnapshot,
-        registry: DeviceRegistry,
         diagnostics: DiscoveryDiagnostics,
-        scanScope: CoroutineScope
+        resolvePipeline: MdnsResolvePipeline
     ) = coroutineScope {
-        val types = MDNS_SERVICE_TYPES
         val semaphore = Semaphore(MDNS_PARALLEL_DISCOVERIES)
-        types.map { type ->
+        MDNS_SERVICE_TYPES.map { type ->
             async {
-                semaphore.withPermit { discoverOneServiceType(type, snapshot.network, registry, diagnostics, scanScope) }
+                semaphore.withPermit { discoverOneServiceType(type, snapshot.network, resolvePipeline, diagnostics) }
             }
         }.awaitAll()
     }
@@ -466,114 +509,217 @@ class LanDiscoveryEngine(context: Context) {
     private suspend fun discoverOneServiceType(
         serviceType: String,
         network: Network?,
-        registry: DeviceRegistry,
-        diagnostics: DiscoveryDiagnostics,
-        scanScope: CoroutineScope
+        resolvePipeline: MdnsResolvePipeline,
+        diagnostics: DiscoveryDiagnostics
     ) {
         diagnostics.sourceStarted("mDNS")
-        suspendCancellableCoroutine { continuation ->
-            var started = false
-            var stopRequested = false
-            lateinit var listener: NsdManager.DiscoveryListener
-            fun finish() {
-                if (continuation.isActive) continuation.resume(Unit)
-            }
-            fun requestStop() {
-                if (stopRequested) return
-                stopRequested = true
-                if (started) runCatching { nsdManager.stopServiceDiscovery(listener) }.onFailure { finish() } else finish()
-            }
-            listener = object : NsdManager.DiscoveryListener {
-                override fun onDiscoveryStarted(regType: String) {
-                    started = true
-                    mainHandler.postDelayed({ requestStop() }, MDNS_WINDOW_MILLIS)
+        // 看门狗：即使 NSD 的 start / stop 回调全部丢失（部分 OEM 实现存在该问题），
+        // withTimeoutOrNull 也会让协程按时结束，扫描不会无限停留在“正在扫描”。
+        val completed = withTimeoutOrNull(MDNS_HARD_DEADLINE_MILLIS) {
+            suspendCancellableCoroutine { continuation ->
+                val started = AtomicBoolean(false)
+                var stopRequested = false
+                lateinit var listener: NsdManager.DiscoveryListener
+                var stopRunnable: Runnable? = null
+
+                fun finish() {
+                    stopRunnable?.let { mainHandler.removeCallbacks(it) }
+                    if (continuation.isActive) continuation.resume(Unit)
                 }
-                override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-                    diagnostics.sourceResponse("mDNS", "type=$serviceType instance=${serviceInfo.serviceName}")
-                    resolveMdnsService(serviceInfo, registry, diagnostics, scanScope, network)
+
+                fun requestStop() {
+                    if (stopRequested) return
+                    stopRequested = true
+                    if (started.get()) {
+                        runCatching { nsdManager.stopServiceDiscovery(listener) }.onFailure { finish() }
+                    } else {
+                        finish()
+                    }
                 }
-                override fun onServiceLost(serviceInfo: NsdServiceInfo) = Unit
-                override fun onDiscoveryStopped(type: String) = finish()
-                override fun onStartDiscoveryFailed(type: String, errorCode: Int) {
-                    diagnostics.sourceFailure("mDNS", "start type=$type code=$errorCode")
+
+                fun scheduleStop(delayMillis: Long) {
+                    stopRunnable?.let { mainHandler.removeCallbacks(it) }
+                    val runnable = Runnable { requestStop() }
+                    stopRunnable = runnable
+                    mainHandler.postDelayed(runnable, delayMillis)
+                }
+
+                listener = object : NsdManager.DiscoveryListener {
+                    override fun onDiscoveryStarted(regType: String) {
+                        started.set(true)
+                        // 监听窗口从发现真正建立后开始计时。
+                        scheduleStop(MDNS_WINDOW_MILLIS)
+                    }
+
+                    override fun onServiceFound(serviceInfo: NsdServiceInfo) {
+                        diagnostics.sourceResponse("mDNS", "type=$serviceType instance=${serviceInfo.serviceName}")
+                        resolvePipeline.enqueue(serviceInfo)
+                    }
+
+                    override fun onServiceLost(serviceInfo: NsdServiceInfo) = Unit
+
+                    override fun onDiscoveryStopped(type: String) = finish()
+
+                    override fun onStartDiscoveryFailed(type: String, errorCode: Int) {
+                        diagnostics.sourceFailure("mDNS", "start type=$type code=$errorCode")
+                        finish()
+                    }
+
+                    override fun onStopDiscoveryFailed(type: String, errorCode: Int) {
+                        diagnostics.sourceFailure("mDNS", "stop type=$type code=$errorCode")
+                        finish()
+                    }
+                }
+                continuation.invokeOnCancellation {
+                    stopRunnable?.let { mainHandler.removeCallbacks(it) }
+                    if (started.get()) runCatching { nsdManager.stopServiceDiscovery(listener) }
+                }
+                val request = runCatching {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && network != null) {
+                        nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, network, callbackExecutor, listener)
+                    } else {
+                        nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, listener)
+                    }
+                }
+                request.onFailure {
+                    diagnostics.sourceFailure("mDNS", "request type=$serviceType reason=${it.javaClass.simpleName}")
                     finish()
                 }
-                override fun onStopDiscoveryFailed(type: String, errorCode: Int) {
-                    diagnostics.sourceFailure("mDNS", "stop type=$type code=$errorCode")
-                    finish()
+                // 兜底：onDiscoveryStarted 延迟或丢失时，仍按窗口加宽限发起停止。
+                if (request.isSuccess && !started.get()) {
+                    scheduleStop(MDNS_WINDOW_MILLIS + MDNS_START_GRACE_MILLIS)
                 }
             }
-            continuation.invokeOnCancellation {
-                if (started) runCatching { nsdManager.stopServiceDiscovery(listener) }
-            }
-            runCatching {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && network != null) {
-                    nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, network, callbackExecutor, listener)
-                } else {
-                    nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, listener)
-                }
-            }.onFailure {
-                diagnostics.sourceFailure("mDNS", "request type=$serviceType reason=${it.javaClass.simpleName}")
-                finish()
-            }
+        }
+        if (completed == null) {
+            diagnostics.sourceFailure("mDNS", "watchdog timeout type=$serviceType")
         }
     }
 
-    private fun resolveMdnsService(
-        service: NsdServiceInfo,
-        registry: DeviceRegistry,
-        diagnostics: DiscoveryDiagnostics,
-        scanScope: CoroutineScope,
-        network: Network?
+    /**
+     * 串行化的 mDNS 服务解析队列。
+     *
+     * Android 的 NsdManager 在 API 34 之前同一时刻只允许一个 resolveService 在途，
+     * 并发调用会直接失败并丢失证据。这里用互斥锁把解析请求排队执行；
+     * 每个解析带独立超时，整个队列带总时间预算，超预算的解析直接跳过，
+     * 保证扫描窗口结束后结果仍会被合并进设备列表并计入完成统计。
+     */
+    private inner class MdnsResolvePipeline(
+        private val registry: DeviceRegistry,
+        private val diagnostics: DiscoveryDiagnostics,
+        private val scanScope: CoroutineScope
     ) {
-        runCatching {
-            nsdManager.resolveService(service, object : NsdManager.ResolveListener {
-                override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                    diagnostics.sourceFailure("mDNS", "resolve instance=${serviceInfo.serviceName} code=$errorCode")
-                }
-                override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
-                    val host = serviceInfo.host
-                    val address = host?.hostAddress
-                    val attributes = serviceInfo.attributes
-                        .mapValues { (_, value) -> value.toString(StandardCharsets.UTF_8) }
-                        .filterValues { it.isNotBlank() }
-                    val label = serviceLabel(serviceInfo.serviceType)
-                    val publicIdentity = MdnsIdentityNormalizer.normalize(attributes, serviceInfo.serviceName)
-                    val hostname = host?.hostName?.removeSuffix(".local.")?.removeSuffix(".local")?.takeIf { it.isNotBlank() }
-                    val model = publicIdentity.model
-                    val manufacturerModel = listOfNotNull(publicIdentity.manufacturer, model).joinToString(" ").takeIf { it.isNotBlank() }
-                    val displayName = hostname ?: publicIdentity.friendlyName ?: manufacturerModel ?: "未知设备"
-                    val nameSource = when {
-                        hostname != null -> "mDNS hostname"
-                        publicIdentity.friendlyName != null -> "mDNS 服务名称"
-                        manufacturerModel != null -> "mDNS 厂商与型号"
-                        else -> "未知"
+        private val mutex = Mutex()
+        private val pending = AtomicInteger(0)
+
+        @Volatile
+        private var budgetDeadline = Long.MAX_VALUE
+
+        @Volatile
+        private var acceptNew = true
+
+        fun startBudget(budgetMillis: Long) {
+            budgetDeadline = System.currentTimeMillis() + budgetMillis
+        }
+
+        fun enqueue(service: NsdServiceInfo) {
+            if (!acceptNew) return
+            pending.incrementAndGet()
+            scanScope.launch {
+                try {
+                    mutex.withLock {
+                        if (System.currentTimeMillis() <= budgetDeadline) {
+                            resolveOne(service)
+                        } else {
+                            diagnostics.sourceFailure("mDNS", "resolve skipped over-budget instance=${service.serviceName}")
+                        }
                     }
-                    registry.upsert(
-                        LanDevice(
-                            id = "mdns:${serviceInfo.serviceName}:${serviceInfo.serviceType}",
-                            displayName = displayName,
-                            hostname = hostname,
-                            addresses = address?.let { setOf(it) } ?: emptySet(),
-                            ports = serviceInfo.port.takeIf { it > 0 }?.let { setOf(it) } ?: emptySet(),
-                            services = setOf(label),
-                            sources = setOf("mDNS / DNS-SD"),
-                            manufacturer = publicIdentity.manufacturer,
-                            deviceHint = model ?: classifyService(label),
-                            details = attributes + publicIdentity.asDetails() + mapOf(
-                                "mDNS 服务" to label,
-                                "mDNS 服务实例" to serviceInfo.serviceName,
-                                "mDNS 服务类型" to serviceInfo.serviceType,
-                                "mDNS 端口" to serviceInfo.port.takeIf { it > 0 }?.toString().orEmpty(),
-                                "名称来源" to nameSource
-                            ),
-                            lastSeenAt = System.currentTimeMillis()
-                        )
-                    )
-                    diagnostics.observation("mDNS", "ip=${address ?: "none"} hostname=${hostname ?: "none"} service=$label")
+                } finally {
+                    pending.decrementAndGet()
                 }
-            })
-        }.onFailure { diagnostics.sourceFailure("mDNS", "resolve request reason=${it.javaClass.simpleName}") }
+            }
+        }
+
+        /** 所有发现窗口结束后调用：等待仍在排队的解析完成，带总上限。 */
+        suspend fun awaitCompletion() {
+            acceptNew = false
+            val waitDeadline = System.currentTimeMillis() + MDNS_RESOLVE_BUDGET_MILLIS + MDNS_RESOLVE_TIMEOUT_MILLIS
+            while (pending.get() > 0 && System.currentTimeMillis() < waitDeadline) {
+                delay(50)
+            }
+            if (pending.get() > 0) {
+                diagnostics.sourceFailure("mDNS", "resolve queue overdue pending=${pending.get()}")
+            }
+        }
+
+        private suspend fun resolveOne(service: NsdServiceInfo) {
+            val resolved = withTimeoutOrNull(MDNS_RESOLVE_TIMEOUT_MILLIS) {
+                suspendCancellableCoroutine { continuation ->
+                    val listener = object : NsdManager.ResolveListener {
+                        override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                            diagnostics.sourceFailure("mDNS", "resolve instance=${serviceInfo.serviceName} code=$errorCode")
+                            if (continuation.isActive) continuation.resume(Unit)
+                        }
+
+                        override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
+                            publishMdnsDevice(serviceInfo)
+                            if (continuation.isActive) continuation.resume(Unit)
+                        }
+                    }
+                    continuation.invokeOnCancellation { }
+                    runCatching { nsdManager.resolveService(service, listener) }.onFailure {
+                        diagnostics.sourceFailure("mDNS", "resolve request instance=${service.serviceName} reason=${it.javaClass.simpleName}")
+                        if (continuation.isActive) continuation.resume(Unit)
+                    }
+                }
+            }
+            if (resolved == null) {
+                // NSD 解析无法主动取消；超时后放弃等待，继续处理队列中的下一个。
+                diagnostics.sourceFailure("mDNS", "resolve timeout instance=${service.serviceName}")
+            }
+        }
+
+        private fun publishMdnsDevice(serviceInfo: NsdServiceInfo) {
+            val host = serviceInfo.host
+            val address = host?.hostAddress
+            val attributes = serviceInfo.attributes
+                .mapValues { (_, value) -> value.toString(StandardCharsets.UTF_8) }
+                .filterValues { it.isNotBlank() }
+            val label = serviceLabel(serviceInfo.serviceType)
+            val publicIdentity = MdnsIdentityNormalizer.normalize(attributes, serviceInfo.serviceName)
+            val hostname = host?.hostName?.removeSuffix(".local.")?.removeSuffix(".local")?.takeIf { it.isNotBlank() }
+            val model = publicIdentity.model
+            val manufacturerModel = listOfNotNull(publicIdentity.manufacturer, model).joinToString(" ").takeIf { it.isNotBlank() }
+            val displayName = hostname ?: publicIdentity.friendlyName ?: manufacturerModel ?: "未知设备"
+            val nameSource = when {
+                hostname != null -> "mDNS hostname"
+                publicIdentity.friendlyName != null -> "mDNS 服务名称"
+                manufacturerModel != null -> "mDNS 厂商与型号"
+                else -> "未知"
+            }
+            registry.upsert(
+                LanDevice(
+                    id = "mdns:${serviceInfo.serviceName}:${serviceInfo.serviceType}",
+                    displayName = displayName,
+                    hostname = hostname,
+                    addresses = address?.let { setOf(it) } ?: emptySet(),
+                    ports = serviceInfo.port.takeIf { it > 0 }?.let { setOf(it) } ?: emptySet(),
+                    services = setOf(label),
+                    sources = setOf("mDNS / DNS-SD"),
+                    manufacturer = publicIdentity.manufacturer,
+                    deviceHint = model ?: classifyService(label),
+                    details = attributes + publicIdentity.asDetails() + mapOf(
+                        "mDNS 服务" to label,
+                        "mDNS 服务实例" to serviceInfo.serviceName,
+                        "mDNS 服务类型" to serviceInfo.serviceType,
+                        "mDNS 端口" to serviceInfo.port.takeIf { it > 0 }?.toString().orEmpty(),
+                        "名称来源" to nameSource
+                    ),
+                    lastSeenAt = System.currentTimeMillis()
+                )
+            )
+            diagnostics.observation("mDNS", "ip=${address ?: "none"} hostname=${hostname ?: "none"} service=$label")
+        }
     }
 
     private suspend fun discoverSsdp(snapshot: LanNetworkSnapshot, registry: DeviceRegistry, diagnostics: DiscoveryDiagnostics) = withContext(Dispatchers.IO) {
@@ -586,49 +732,68 @@ class LanDiscoveryEngine(context: Context) {
                 socket.bind(InetSocketAddress(localBindAddress, 0))
                 snapshot.network?.bindSocket(socket)
                 socket.soTimeout = SSDP_RECEIVE_TIMEOUT_MILLIS
-                socket.send(DatagramPacket(request, request.size, InetAddress.getByName(SSDP_ADDRESS), SSDP_PORT))
-                val deadline = System.currentTimeMillis() + SSDP_WINDOW_MILLIS
-                while (System.currentTimeMillis() < deadline && kotlinx.coroutines.currentCoroutineContext().isActive) {
-                    val buffer = ByteArray(4096)
-                    val response = DatagramPacket(buffer, buffer.size)
+                val group = InetSocketAddress(InetAddress.getByName(SSDP_ADDRESS), SSDP_PORT)
+                socket.send(DatagramPacket(request, request.size, group))
+                val startedAtMs = System.currentTimeMillis()
+                val retransmitAt = startedAtMs + SSDP_RETRANSMIT_AFTER_MILLIS
+                val deadline = startedAtMs + SSDP_WINDOW_MILLIS
+                var retransmitted = false
+                // 复用接收缓冲；DatagramPacket 每次接收前必须重置长度。
+                val buffer = ByteArray(SSDP_BUFFER_BYTES)
+                val response = DatagramPacket(buffer, buffer.size)
+                // 同一物理设备会按不同 ST / USN 返回多条响应；按 USN 中的 UDN 聚合，并丢弃重复报文。
+                val deviceTypes = HashMap<String, LinkedHashSet<String>>()
+                val seenResponses = HashSet<String>()
+                while (System.currentTimeMillis() < deadline && currentCoroutineContext().isActive) {
+                    if (!retransmitted && System.currentTimeMillis() >= retransmitAt) {
+                        retransmitted = true
+                        // 组播在 Wi-Fi 上可能丢失；窗口中段补发一次 M-SEARCH 提升响应率。
+                        runCatching { socket.send(DatagramPacket(request, request.size, group)) }
+                            .onFailure { diagnostics.sourceFailure("SSDP", "retransmit reason=${it.javaClass.simpleName}") }
+                    }
+                    response.length = buffer.size
                     try {
                         socket.receive(response)
-                        val headers = parseHeaders(String(response.data, 0, response.length, StandardCharsets.UTF_8))
-                        val address = response.address.hostAddress.orEmpty()
-                        diagnostics.sourceResponse("SSDP", "ip=$address usn=${headers["usn"] ?: "none"} st=${headers["st"] ?: "none"}")
-                        if (address.isBlank()) continue
-                        val type = headers["st"] ?: headers["nt"] ?: "UPnP 设备"
-                        // 默认发现仅保留 SSDP 服务证据；UPnP XML 在详情页由用户手动触发型号识别时再读取。
-                        val displayName = "未知设备" to "未知"
-                        val aliases = buildMap {
-                            headers["usn"]?.let { put("SSDP USN", it) }
-                            headers["server"]?.let { put("SSDP SERVER", it) }
-                            headers["st"]?.let { put("SSDP ST", it) }
-                            headers["cache-control"]?.let { put("SSDP CACHE-CONTROL", it) }
-                            headers["location"]?.let { put("SSDP LOCATION", it) }
-                        }
-                        registry.upsert(
-                            LanDevice(
-                                id = "ssdp:${headers["usn"] ?: address}",
-                                displayName = displayName.first,
-                                hostname = null,
-                                addresses = setOf(address),
-                                ports = setOf(SSDP_PORT),
-                                services = setOf("UPnP / SSDP"),
-                                sources = setOf("SSDP / UPnP"),
-                                manufacturer = null,
-                                deviceHint = classifySsdp(type),
-                                details = aliases + mapOf(
-                                    "名称来源" to displayName.second,
-                                    "UPnP 设备类型" to type
-                                ),
-                                lastSeenAt = System.currentTimeMillis()
-                            )
-                        )
-                        diagnostics.observation("SSDP", "ip=$address name=${displayName.first} type=$type")
                     } catch (_: java.net.SocketTimeoutException) {
-                        // 在完整监听窗口内持续接收；短超时仅用于检查取消条件。
+                        // 短超时仅用于周期性检查取消与重传条件。
+                        continue
                     }
+                    val headers = parseHeaders(String(response.data, 0, response.length, StandardCharsets.UTF_8))
+                    val address = response.address.hostAddress.orEmpty()
+                    diagnostics.sourceResponse("SSDP", "ip=$address usn=${headers["usn"] ?: "none"} st=${headers["st"] ?: "none"}")
+                    if (address.isBlank()) continue
+                    val type = headers["st"] ?: headers["nt"] ?: "UPnP 设备"
+                    val deviceKey = headers["usn"]?.substringBefore("::")?.takeIf { it.isNotBlank() } ?: address
+                    if (!seenResponses.add("$deviceKey|$type")) continue
+                    val types = deviceTypes.getOrPut(deviceKey) { LinkedHashSet() }
+                    types += type
+                    // 默认发现仅保留 SSDP 服务证据；UPnP XML 在详情页由用户手动触发型号识别时再读取。
+                    val aliases = buildMap {
+                        headers["server"]?.let { put("SSDP SERVER", it) }
+                        headers["cache-control"]?.let { put("SSDP CACHE-CONTROL", it) }
+                        headers["location"]?.let { put("SSDP LOCATION", it) }
+                    }
+                    registry.upsert(
+                        LanDevice(
+                            id = "ssdp:$deviceKey",
+                            displayName = "未知设备",
+                            hostname = null,
+                            addresses = setOf(address),
+                            ports = setOf(SSDP_PORT),
+                            services = setOf("UPnP / SSDP"),
+                            sources = setOf("SSDP / UPnP"),
+                            manufacturer = null,
+                            deviceHint = classifySsdp(type),
+                            details = aliases + mapOf(
+                                "SSDP USN" to (headers["usn"] ?: deviceKey),
+                                "SSDP ST" to type,
+                                "名称来源" to "未知",
+                                "UPnP 设备类型" to types.joinToString("；")
+                            ),
+                            lastSeenAt = System.currentTimeMillis()
+                        )
+                    )
+                    diagnostics.observation("SSDP", "ip=$address type=$type")
                 }
             }
         }.onFailure { diagnostics.sourceFailure("SSDP", "request reason=${it.javaClass.simpleName}") }
@@ -674,12 +839,17 @@ class LanDiscoveryEngine(context: Context) {
 
     private class DeviceRegistry(
         private val publishSnapshot: (List<LanDevice>) -> Unit,
-        private val diagnostics: DiscoveryDiagnostics
+        private val diagnostics: DiscoveryDiagnostics,
+        private val mainHandler: Handler
     ) {
         private val devices = linkedMapOf<String, LanDevice>()
         private val aliasIndex = mutableMapOf<String, String>()
         private val rawObservations = AtomicInteger(0)
         private var serial = 0
+        private val publishGate = Any()
+
+        @Volatile
+        private var publishScheduled = false
 
         @Synchronized
         fun upsert(incoming: LanDevice) {
@@ -695,7 +865,36 @@ class LanDiscoveryEngine(context: Context) {
             devices[canonicalId] = merged
             aliasesFor(merged).forEach { aliasIndex[it] = canonicalId }
             diagnostics.devicePublished(merged)
+            schedulePublish()
+        }
+
+        /**
+         * 合并发布：扫描高峰期同一时刻可能有多条证据（如 SSDP 突发响应）连续到达，
+         * 每条都推送一次完整快照会造成主线程与重组风暴；这里用脏标记把同一帧内的多次
+         * 证据合并为一次推送，最后一次证据仍然保证会触发一次最终发布。
+         */
+        private fun schedulePublish() {
+            synchronized(publishGate) {
+                if (publishScheduled) return
+                publishScheduled = true
+            }
+            mainHandler.post {
+                synchronized(publishGate) { publishScheduled = false }
+                publishSnapshot(snapshot())
+            }
+        }
+
+        /** 扫描结束前的最终发布，确保完成统计与设备列表一致。 */
+        fun publishNow() {
             publishSnapshot(snapshot())
+        }
+
+        /** 该 IP 是否已带有相同 MAC 的邻居证据；二次 ARP 读取时用于跳过没有新信息的条目。 */
+        @Synchronized
+        fun hasNeighborEntry(ipAddress: String, macAddress: String): Boolean {
+            val canonicalId = aliasIndex["ip:${ipAddress.lowercase()}"] ?: return false
+            val device = devices[canonicalId] ?: return false
+            return device.details["MAC 地址"]?.equals(macAddress, ignoreCase = true) == true
         }
 
         @Synchronized fun snapshot(): List<LanDevice> = devices.values.toList()
@@ -748,12 +947,34 @@ class LanDiscoveryEngine(context: Context) {
     }
 
     private companion object {
-        const val MDNS_WINDOW_MILLIS = 1_800L
-        const val MDNS_PARALLEL_DISCOVERIES = 3
+        /** mDNS 单个服务类型的监听窗口，从 onDiscoveryStarted 回调后开始计时。 */
+        const val MDNS_WINDOW_MILLIS = 1_500L
+
+        /** onDiscoveryStarted 延迟或丢失时的兜底停止宽限（相对 discoverServices 调用时刻）。 */
+        const val MDNS_START_GRACE_MILLIS = 1_000L
+
+        /** 单个服务类型发现的整体硬超时：即使 NSD 回调全部丢失也保证协程能结束。 */
+        const val MDNS_HARD_DEADLINE_MILLIS = MDNS_WINDOW_MILLIS + 2_500L
+
+        /** 同一时刻并行的 NSD 服务类型发现数量；10 种类型约两轮窗口即可完成。 */
+        const val MDNS_PARALLEL_DISCOVERIES = 5
+
+        /** 单个 mDNS 服务解析（resolveService）的等待超时。 */
+        const val MDNS_RESOLVE_TIMEOUT_MILLIS = 2_500L
+
+        /** mDNS 解析队列的总时间预算；超预算的解析请求直接跳过，避免拖长整体扫描。 */
+        const val MDNS_RESOLVE_BUDGET_MILLIS = 7_000L
+
         const val SSDP_ADDRESS = "239.255.255.250"
         const val SSDP_PORT = 1900
-        const val SSDP_WINDOW_MILLIS = 4_500L
+
+        /** SSDP 监听窗口；覆盖 M-SEARCH 重传后 MX=3 的完整响应期。 */
+        const val SSDP_WINDOW_MILLIS = 5_000L
+
+        /** M-SEARCH 首发后补发一次重传的间隔，缓解组播丢包。 */
+        const val SSDP_RETRANSMIT_AFTER_MILLIS = 1_500L
         const val SSDP_RECEIVE_TIMEOUT_MILLIS = 600
+        const val SSDP_BUFFER_BYTES = 4096
         val MDNS_SERVICE_TYPES = listOf(
             "_http._tcp.", "_https._tcp.", "_ssh._tcp.", "_smb._tcp.", "_ipp._tcp.",
             "_printer._tcp.", "_airplay._tcp.", "_raop._tcp.", "_googlecast._tcp.", "_hap._tcp."
@@ -846,6 +1067,7 @@ data class LanScanSummary(
     val scannedHostCount: Int,
     val hotspotNeighborCount: Int = 0,
     val hotspotNeighborCacheReadable: Boolean = false,
+    val publicServiceDeviceCount: Int = 0,
     val diagnostics: LanDiscoveryDiagnostics
 )
 

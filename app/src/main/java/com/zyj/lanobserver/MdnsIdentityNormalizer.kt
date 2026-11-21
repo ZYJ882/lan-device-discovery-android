@@ -3,11 +3,12 @@ package com.zyj.lanobserver
 /** 将不同厂商公开的 DNS-SD TXT 键规范化为名称、厂商与型号；不基于端口进行猜测。 */
 object MdnsIdentityNormalizer {
     fun normalize(attributes: Map<String, String>, fallbackName: String): MdnsPublicIdentity {
-        val normalized = attributes
-            .mapKeys { (key, _) -> key.trim().lowercase() }
-            .mapValues { (_, value) -> value.normalizedValue() }
-            .filterValues { it != null }
-            .mapValues { (_, value) -> value.orEmpty() }
+        // 单次遍历完成键规范化与值清洗，避免原实现中重复的 map/filter/mapValues 链。
+        val normalized = buildMap {
+            attributes.forEach { (key, value) ->
+                value.normalizedValue()?.let { cleaned -> put(key.trim().lowercase(), cleaned) }
+            }
+        }
 
         val name = normalized.firstValue("fn", "friendlyname", "name", "device_name")
             ?: fallbackName.normalizedValue()
@@ -22,7 +23,7 @@ object MdnsIdentityNormalizer {
 
     private fun Map<String, String>.firstValue(vararg keys: String): String? = keys
         .asSequence()
-        .mapNotNull { this[it]?.normalizedValue() }
+        .mapNotNull { this[it] }
         .firstOrNull()
 
     private fun String?.normalizedValue(): String? = this

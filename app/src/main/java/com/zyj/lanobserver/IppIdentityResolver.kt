@@ -30,7 +30,7 @@ class IppIdentityResolver {
             connection.setFixedLengthStreamingMode(payload.size)
             connection.setRequestProperty("Content-Type", "application/ipp")
             connection.setRequestProperty("Accept", "application/ipp")
-            connection.setRequestProperty("User-Agent", "LanDeviceDiscovery/1.4")
+            connection.setRequestProperty("User-Agent", "LanDeviceDiscovery/2.3.9")
             connection.outputStream.use { it.write(payload) }
             if (connection.responseCode !in 200..299) return null
             connection.inputStream.use { it.readBounded(MAX_RESPONSE_BYTES) }

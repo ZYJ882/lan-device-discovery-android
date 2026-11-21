@@ -1,5 +1,6 @@
 package com.zyj.lanobserver
 
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -30,6 +31,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -55,12 +57,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.text.DateFormat
+import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
@@ -73,6 +79,50 @@ private val LanMuted: Color @Composable get() = if (isSystemInDarkTheme()) Color
 private val LanLine: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF344656) else Color(0xFFE4E7EC)
 private val LanPage: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF101720) else Color(0xFFF7F9FC)
 private val LanCard: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF18232F) else Color.White
+private val LanTagBg: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF20313F) else Color(0xFFF1F5FB)
+private val LanVioletBg: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF2B2543) else Color(0xFFF1EBFF)
+private val LanAmberBg: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF3A2E12) else Color(0xFFFFF4E5)
+private val LanAmberFg: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFFE9C274) else Color(0xFF9A6700)
+private val LanDangerBg: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF3C1D1A) else Color(0xFFFFF1F0)
+private val LanDangerFg: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFFF3B8B4) else Color(0xFFB42318)
+private val LanSuccessChipBg: Color @Composable get() = if (isSystemInDarkTheme()) Color(0xFF153C32) else Color(0xFFE8F5EE)
+
+/** 设备卡片上的相对响应时间：帮助用户判断证据的新鲜程度。 */
+private fun formatRelativeSeen(timestamp: Long): String {
+    val deltaMillis = System.currentTimeMillis() - timestamp
+    return when {
+        deltaMillis < 60_000L -> "刚刚响应"
+        deltaMillis < 3_600_000L -> "${deltaMillis / 60_000L} 分钟前响应"
+        deltaMillis < 86_400_000L -> "${deltaMillis / 3_600_000L} 小时前响应"
+        else -> "超过一天前响应"
+    }
+}
+
+/** 详情页的绝对时间：完整到秒，便于与外部日志核对。 */
+private fun formatAbsoluteSeen(timestamp: Long): String =
+    SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(Date(timestamp))
+
+/**
+ * 详情页字段语义排序：发现环境在前，mDNS / UPnP / SSDP / IPP / ONVIF 证据按协议分组在后，
+ * 兜底键（名称来源）与未知键排在末尾；替代旧的字典序（ASCII 字母键会全部扎堆在中文键之前）。
+ */
+private val detailKeyOrder = listOf(
+    "发现网络", "发现子网", "网络接口", "网络模式", "邻居接口", "邻居证据",
+    "本机地址范围", "本机网络状态", "本机接口",
+    "mDNS 服务", "mDNS 服务实例", "mDNS 服务类型", "mDNS 端口",
+    "mDNS TXT 公开声明", "mDNS 公开厂商",
+    "UPnP 设备类型", "UPnP friendlyName", "UPnP 厂商", "UPnP 设备描述", "UPnP 描述公开声明",
+    "UPnP serialNumber", "UPnP UDN", "UPnP deviceType",
+    "SSDP USN", "SSDP ST", "SSDP SERVER", "SSDP CACHE-CONTROL", "SSDP LOCATION",
+    "IPP 打印机名称", "IPP 打印机说明", "IPP 打印机位置", "IPP 打印机 UUID", "IPP 设备标识", "IPP 标准只读属性",
+    "ONVIF XAddr",
+    "名称来源"
+)
+
+private fun detailSortKey(key: String): Int {
+    val index = detailKeyOrder.indexOf(key)
+    return if (index >= 0) index else detailKeyOrder.size
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -137,6 +187,7 @@ fun LanDiscoveryScreen(
             item {
                 DeviceToolbar(
                     count = state.devices.size,
+                    filteredCount = state.visibleDevices.size,
                     query = state.searchQuery,
                     onFilter = onFilter
                 )
@@ -273,9 +324,24 @@ private fun NetworkStatusCard(
                 }
             }
             if (isScanning) {
-                LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
+                val progressRatio = progress?.takeIf { it.totalHosts > 0 }?.let { it.completedHosts.toFloat() / it.totalHosts }
+                if (progressRatio != null) {
+                    LinearProgressIndicator(progress = { progressRatio }, modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
+                } else {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = LanBlue, trackColor = LanSky)
+                }
                 Spacer(Modifier.height(5.dp))
-                Text(progress?.let { if (it.totalHosts > 0) "${it.message} · ${it.completedHosts}/${it.totalHosts}" else it.message } ?: "正在准备扫描", color = LanMuted, fontSize = 11.sp)
+                Text(
+                    progress?.let {
+                        if (it.totalHosts > 0) {
+                            "${it.message} · ${it.completedHosts}/${it.totalHosts}（${((progressRatio ?: 0f) * 100).toInt()}%）"
+                        } else {
+                            it.message
+                        }
+                    } ?: "正在准备扫描",
+                    color = LanMuted,
+                    fontSize = 11.sp
+                )
             }
         }
     }
@@ -293,8 +359,8 @@ private fun NetworkTypeMark(kind: LanNetworkKind) {
         LanNetworkKind.OTHER -> "其"
     }
     val background = when (kind) {
-        LanNetworkKind.CELLULAR -> Color(0xFFF1EBFF)
-        LanNetworkKind.VPN -> Color(0xFFFFF4E5)
+        LanNetworkKind.CELLULAR -> LanVioletBg
+        LanNetworkKind.VPN -> LanAmberBg
         LanNetworkKind.HOTSPOT -> LanSuccessBg
         else -> LanSky
     }
@@ -311,6 +377,7 @@ private fun NetworkDetailDialog(network: LanNetworkUi, onDismiss: () -> Unit) {
         title = { Text("${network.title}详情", color = LanBlueDark, fontWeight = FontWeight.Bold) },
         text = {
             Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+                CopyHintBar()
                 network.displayName?.let { DeviceDetailRow("名称", it) }
                 DeviceDetailRow("状态", if (network.isValidated || network.isScanTarget) "已连接" else "已存在")
                 network.localIpv4?.let { DeviceDetailRow("IPv4", it) }
@@ -332,6 +399,18 @@ private fun NetworkDetailDialog(network: LanNetworkUi, onDismiss: () -> Unit) {
     )
 }
 
+/** 详情页顶部提示条：说明任意一行可点按复制，带图标与底色更易被发现。 */
+@Composable
+private fun CopyHintBar() {
+    Surface(color = LanSky, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)) {
+            Icon(Icons.Filled.ContentCopy, contentDescription = null, tint = LanBlue, modifier = Modifier.size(12.dp))
+            Spacer(Modifier.width(5.dp))
+            Text("点按任意一行可复制该行内容", color = LanBlueDark, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+        }
+    }
+}
+
 @Composable
 private fun NetworkValueRow(label: String, value: String) {
     Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -342,8 +421,8 @@ private fun NetworkValueRow(label: String, value: String) {
 
 @Composable
 private fun StatusBadge(text: String, active: Boolean) {
-    val background = if (active) LanSuccessBg else Color(0xFFFFF1F0)
-    val foreground = if (active) LanSuccess else Color(0xFFB42318)
+    val background = if (active) LanSuccessBg else LanDangerBg
+    val foreground = if (active) LanSuccess else LanDangerFg
     Surface(shape = CircleShape, color = background) {
         Text(text, modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp), color = foreground, fontSize = 11.sp, fontWeight = FontWeight.Bold)
     }
@@ -365,12 +444,16 @@ private fun ScanNotice(message: String, lastScanLabel: String?) {
 }
 
 @Composable
-private fun DeviceToolbar(count: Int, query: String, onFilter: (String) -> Unit) {
+private fun DeviceToolbar(count: Int, filteredCount: Int, query: String, onFilter: (String) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("发现的设备", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = LanBlueDark)
             Spacer(Modifier.weight(1f))
-            Text("$count 台", color = LanMuted, fontSize = 13.sp)
+            val countLabel = when {
+                query.isBlank() || filteredCount == count -> "$count 台"
+                else -> "匹配 $filteredCount / 共 $count 台"
+            }
+            Text(countLabel, color = LanMuted, fontSize = 13.sp)
         }
         OutlinedTextField(
             value = query,
@@ -417,14 +500,32 @@ private fun DeviceCard(device: LanDevice, onClick: () -> Unit) {
                 }
                 device.details["型号识别证据"]?.let { evidence ->
                     Spacer(Modifier.height(5.dp))
-                    Surface(shape = RoundedCornerShape(7.dp), color = Color(0xFFE8F5EE)) {
-                        Text("公开型号 · $evidence", modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp), fontSize = 10.sp, color = LanSuccess)
+                    Surface(shape = RoundedCornerShape(7.dp), color = LanSuccessChipBg) {
+                        Text(
+                            "公开型号 · $evidence",
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
+                            fontSize = 10.sp,
+                            color = LanSuccess,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
                 }
                 val addresses = device.addresses.joinToString(" · ")
                 if (addresses.isNotBlank()) {
                     Spacer(Modifier.height(6.dp))
                     Text(addresses, color = LanBlue, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                }
+                val sourceLine = device.sources.joinToString(" · ")
+                if (sourceLine.isNotBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "来源 $sourceLine · ${formatRelativeSeen(device.lastSeenAt)}",
+                        color = LanMuted,
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
                 if (device.services.isNotEmpty()) {
                     Spacer(Modifier.height(9.dp))
@@ -455,8 +556,19 @@ private fun DeviceMonogram(device: LanDevice) {
 private fun DeviceTagRow(tags: List<String>) {
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
         tags.take(4).forEach { tag ->
-            Surface(shape = RoundedCornerShape(7.dp), color = Color(0xFFF1F5FB)) {
+            Surface(shape = RoundedCornerShape(7.dp), color = LanTagBg) {
                 Text(tag, modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp), fontSize = 10.sp, color = LanBlueDark)
+            }
+        }
+        if (tags.size > 4) {
+            Surface(shape = RoundedCornerShape(7.dp), color = LanTagBg) {
+                Text(
+                    "+${tags.size - 4}",
+                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
+                    fontSize = 10.sp,
+                    color = LanMuted,
+                    fontWeight = FontWeight.Bold
+                )
             }
         }
     }
@@ -486,7 +598,7 @@ private fun EmptyDevicePlaceholder() {
         Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Text("尚未开始扫描", fontWeight = FontWeight.Bold, color = LanBlueDark)
             Spacer(Modifier.height(5.dp))
-            Text("点击“开始发现设备”以查找当前局域网中主动响应的设备。", color = LanMuted, fontSize = 13.sp, lineHeight = 19.sp)
+            Text("点击网络卡片中的“扫描此网络”，查找当前局域网中主动响应的设备。", color = LanMuted, fontSize = 13.sp, lineHeight = 19.sp)
         }
     }
 }
@@ -515,14 +627,17 @@ private fun DeviceDetailDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
-        title = { Text(device.displayName, color = LanBlueDark, fontWeight = FontWeight.Bold) },
+        title = { Text(device.displayName, color = LanBlueDark, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis) },
         text = {
             Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
                 Text(device.deviceHint, color = LanMuted, fontSize = 13.sp)
-                Spacer(Modifier.height(14.dp))
+                Spacer(Modifier.height(6.dp))
+                CopyHintBar()
                 DeviceDetailRow("IP 地址", device.addresses.joinToString("\n").ifBlank { "未获取" })
+                device.details["MAC 地址"]?.takeIf { it.isNotBlank() }?.let { DeviceDetailRow("MAC 地址", it) }
                 device.hostname?.let { DeviceDetailRow("主机名", it) }
                 DeviceDetailRow("发现方式", device.sources.joinToString("、"))
+                DeviceDetailRow("最后响应", formatAbsoluteSeen(device.lastSeenAt))
                 if (device.services.isNotEmpty()) DeviceDetailRow("公开服务", device.services.joinToString("、"))
                 device.manufacturer?.let { DeviceDetailRow("公开厂商", it) }
                 if (!isStandaloneLocalHost) {
@@ -533,9 +648,10 @@ private fun DeviceDetailDialog(
                     if (publicModel != null) DeviceDetailRow("公开型号", publicModel)
                     DeviceDetailRow("型号识别", identityEvidence ?: "未发现设备公开的型号字段")
                 }
-                device.details.toSortedMap().forEach { (key, value) ->
-                    if (key != "型号识别证据" && !key.contains("型号") && value.isNotBlank()) DeviceDetailRow(key, value)
-                }
+                device.details.entries
+                    .filter { (key, value) -> key != "型号识别证据" && key != "MAC 地址" && !key.contains("型号") && value.isNotBlank() }
+                    .sortedWith(compareBy({ detailSortKey(it.key) }, { it.key }))
+                    .forEach { (key, value) -> DeviceDetailRow(key, value) }
                 OuiLookupSection(ouiLookup)
 
                 if (!isStandaloneLocalHost) {
@@ -607,10 +723,10 @@ private fun ModelRecognitionSection(
         val (label, foreground, background) = when (state.result.level) {
             ModelRecognitionLevel.Confirmed -> Triple("已确认型号", LanSuccess, LanSuccessBg)
             ModelRecognitionLevel.PublicDeclared -> Triple("公开声明型号", LanBlue, LanSky)
-            ModelRecognitionLevel.CategoryOnly -> Triple("仅识别设备类别", Color(0xFF9A6700), Color(0xFFFFF4E5))
-            ModelRecognitionLevel.Unavailable -> Triple("未能确认型号", Color(0xFFB42318), Color(0xFFFFF1F0))
-            ModelRecognitionLevel.NeedsCredentials -> Triple("需要 ONVIF 凭据", Color(0xFF9A6700), Color(0xFFFFF4E5))
-            else -> Triple("型号识别", LanMuted, Color(0xFFF1F5FB))
+            ModelRecognitionLevel.CategoryOnly -> Triple("仅识别设备类别", LanAmberFg, LanAmberBg)
+            ModelRecognitionLevel.Unavailable -> Triple("未能确认型号", LanDangerFg, LanDangerBg)
+            ModelRecognitionLevel.NeedsCredentials -> Triple("需要 ONVIF 凭据", LanAmberFg, LanAmberBg)
+            else -> Triple("型号识别", LanMuted, LanTagBg)
         }
         Surface(shape = RoundedCornerShape(10.dp), color = background, modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(11.dp)) {
@@ -701,7 +817,7 @@ private fun OuiSettingsDialog(
                 }
                 message?.let {
                     val feedbackColor = when {
-                        it.startsWith("同步失败") || it.startsWith("同步超时") -> Color(0xFFB42318)
+                        it.startsWith("同步失败") || it.startsWith("同步超时") -> LanDangerFg
                         it.startsWith("已同步") -> LanSuccess
                         else -> LanMuted
                     }
@@ -713,10 +829,30 @@ private fun OuiSettingsDialog(
     )
 }
 
+/** 复制反馈里展示的值预览：只取第一行，过长时截断，避免 Toast 被多行长文本撑爆。 */
+private fun copyPreview(value: String): String {
+    val firstLine = value.lineSequence().firstOrNull { it.isNotBlank() } ?: ""
+    return if (firstLine.length <= 24) firstLine else firstLine.take(24) + "…"
+}
+
 @Composable
 private fun DeviceDetailRow(label: String, value: String) {
-    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 7.dp)) {
-        Text(label, color = LanMuted, fontSize = 11.sp)
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable {
+                clipboard.setText(AnnotatedString(value))
+                Toast.makeText(context, "已复制 $label：${copyPreview(value)}", Toast.LENGTH_SHORT).show()
+            }
+            .padding(vertical = 7.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(label, color = LanMuted, fontSize = 11.sp, modifier = Modifier.weight(1f))
+            Icon(Icons.Filled.ContentCopy, contentDescription = "复制", tint = LanMuted, modifier = Modifier.size(13.dp))
+        }
         Spacer(Modifier.height(2.dp))
         Text(value, color = LanBlueDark, fontSize = 13.sp, lineHeight = 18.sp)
         Spacer(Modifier.height(7.dp))

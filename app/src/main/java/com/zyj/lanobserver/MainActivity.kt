@@ -26,7 +26,10 @@ class MainActivity : ComponentActivity() {
                     secondary = Color(0xFF75DAB2),
                     background = Color(0xFF101720),
                     surface = Color(0xFF18232F),
-                    onSurface = Color(0xFFE1E8F0)
+                    onSurface = Color(0xFFE1E8F0),
+                    surfaceContainer = Color(0xFF18232F),
+                    surfaceContainerHigh = Color(0xFF1B2734),
+                    surfaceContainerHighest = Color(0xFF20313F)
                 )
             } else {
                 lightColorScheme(

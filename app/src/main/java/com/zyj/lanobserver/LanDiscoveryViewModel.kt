@@ -13,10 +13,11 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import java.text.DateFormat
+import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
@@ -28,6 +29,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
     private var scanJob: Job? = null
     private var modelRecognitionJob: Job? = null
     private var ouiSyncJob: Job? = null
+    private var networkRefreshJob: Job? = null
 
     var uiState by mutableStateOf(LanDiscoveryUiState())
         private set
@@ -54,8 +56,17 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    /**
+     * 系统网络回调（onCapabilitiesChanged 等）可能在短时间内密集触发；
+     * 每次都全量查询 ConnectivityManager 会造成 Binder 调用风暴。
+     * 这里做去抖：连续回调合并为一次延迟刷新，最终状态总是会被刷新到。
+     */
     private fun scheduleNetworkRefresh() {
-        viewModelScope.launch { refreshNetwork() }
+        networkRefreshJob?.cancel()
+        networkRefreshJob = viewModelScope.launch {
+            delay(NETWORK_REFRESH_DEBOUNCE_MILLIS)
+            refreshNetwork()
+        }
     }
 
     fun refreshNetwork() {
@@ -98,12 +109,11 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
             selectedDeviceId = null,
             progress = LanScanProgress("正在准备 IP 与公开服务发现", 0, 0),
             lastScanLabel = null,
-                                message = if (snapshot.isHotspot) {
-                        "正在从热点子网 ${snapshot.scanCidr} 的邻居缓存、mDNS 与 UPnP 识别设备 IP。"
-                    } else {
-                        "正在发现 ${snapshot.actualCidr} 中公开广播的设备 IP；不会发送登录请求、读取文件或执行远程命令。"
-                    }
-
+            message = if (snapshot.isHotspot) {
+                "正在从热点子网 ${snapshot.scanCidr} 的邻居缓存、mDNS 与 UPnP 识别设备 IP。"
+            } else {
+                "正在发现 ${snapshot.actualCidr} 中公开广播的设备 IP；不会发送登录请求、读取文件或执行远程命令。"
+            }
         )
         val discoveryNetworkLabel = networkUi.discoveryNetworkLabel()
         val discoverySubnet = networkUi.cidr?.takeIf { it.isNotBlank() }
@@ -123,11 +133,10 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
                     lastScanLabel = "上次扫描：$finishedLabel · ${networkUi.title}",
                     scannedDeviceCounts = uiState.scannedDeviceCounts + (networkUi.id to (summary.discoveredCount - 1).coerceAtLeast(0)),
                     message = if (snapshot.isHotspot) {
-                        val publicServiceCount = (summary.discoveredCount - 1 - summary.hotspotNeighborCount).coerceAtLeast(0)
                         when {
-                            summary.hotspotNeighborCount > 0 -> "热点扫描完成：邻居缓存观测到 ${summary.hotspotNeighborCount} 台当前或近期通信的客户端；其中 $publicServiceCount 台公开了网络服务。"
-                            summary.hotspotNeighborCacheReadable -> "热点扫描完成：邻居缓存暂未观测到客户端，公开服务识别到 $publicServiceCount 台。系统设置中的已连接设备未必会公开服务或产生可读缓存记录。"
-                            else -> "热点扫描完成：系统限制了热点邻居缓存读取，公开服务识别到 $publicServiceCount 台。系统设置中的完整客户端列表仅系统应用可见。"
+                            summary.hotspotNeighborCount > 0 -> "热点扫描完成：邻居缓存共观测到 ${summary.hotspotNeighborCount} 台当前或近期通信的客户端；公开服务证据识别到 ${summary.publicServiceDeviceCount} 台设备。"
+                            summary.hotspotNeighborCacheReadable -> "热点扫描完成：邻居缓存暂未观测到客户端，公开服务识别到 ${summary.publicServiceDeviceCount} 台。系统设置中的已连接设备未必会公开服务或产生可读缓存记录。"
+                            else -> "热点扫描完成：系统限制了热点邻居缓存读取，公开服务识别到 ${summary.publicServiceDeviceCount} 台。系统设置中的完整客户端列表仅系统应用可见。"
                         }
                     } else {
                         val arp = summary.diagnostics.sourceStats["ARP"]?.observations ?: 0
@@ -226,7 +235,7 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
                     withContext(Dispatchers.IO) {
                         ouiDatabase.sync(network) { progress ->
                             viewModelScope.launch {
-                                if (ouiSyncJob?.isActive == true) {
+                                if (uiState.isOuiSyncing) {
                                     uiState = uiState.copy(ouiSyncMessage = "$networkLabel：$progress")
                                 }
                             }
@@ -382,8 +391,10 @@ class LanDiscoveryViewModel(application: Application) : AndroidViewModel(applica
     )
 
     private companion object {
-        val dateFormat: DateFormat = DateFormat.getTimeInstance(DateFormat.SHORT, Locale.CHINA)
+        /** 上次扫描时间带日期（MM-dd HH:mm），避免跨天后仅显示时分造成误导。 */
+        val dateFormat = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
         const val OUI_SYNC_TIMEOUT_MILLIS = 120_000L
+        const val NETWORK_REFRESH_DEBOUNCE_MILLIS = 400L
     }
 }
 

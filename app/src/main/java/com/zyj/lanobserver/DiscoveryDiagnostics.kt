@@ -36,6 +36,12 @@ class DiscoveryDiagnostics(private val snapshot: LanNetworkSnapshot) {
         record("arp.cache readable=$readable entries=$count interface=${snapshot.interfaceName}")
     }
 
+    /** 组播阶段结束后的二次邻居读取；只累计新增证据，不重复计数源状态。 */
+    fun neighborCacheRefresh(total: Int, added: Int) {
+        source("ARP").observations.addAndGet(added)
+        record("arp.refresh entries=$total added=$added interface=${snapshot.interfaceName}")
+    }
+
     fun sourceStarted(name: String) {
         source(name).started.incrementAndGet()
         record("source.start name=$name")

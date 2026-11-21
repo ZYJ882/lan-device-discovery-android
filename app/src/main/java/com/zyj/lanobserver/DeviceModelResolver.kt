@@ -93,6 +93,7 @@ class DeviceModelResolver {
         val address = device.addresses.firstOrNull { runCatching { InetAddress.getByName(it) is Inet4Address }.getOrDefault(false) } ?: return null
         val host = runCatching { InetAddress.getByName(address) }.getOrNull() ?: return null
         val port = device.details["mDNS 端口"]?.toIntOrNull()?.takeIf { it in 1..65535 }
+            ?: device.ports.filter { it in 1..65535 && it != SSDP_UPNP_PORT }.firstOrNull()
             ?: device.ports.firstOrNull { it in 1..65535 }
             ?: return null
         val path = device.details.entries.firstOrNull { (key, _) -> key.equals("rp", ignoreCase = true) }?.value ?: return null
@@ -152,6 +153,11 @@ class DeviceModelResolver {
         rawType.contains("Printer", true) -> "网络打印设备"
         else -> "UPnP 设备"
     }
+
+    private companion object {
+        /** SSDP 固定端口；UPnP 设备常同时广播 SSDP 与 IPP，不应把 1900 当作 IPP 端口。 */
+        const val SSDP_UPNP_PORT = 1900
+    }
 }
 
 private class OnvifIdentityResolver {
@@ -172,7 +178,7 @@ private class OnvifIdentityResolver {
             connection.doOutput = true
             connection.setFixedLengthStreamingMode(payload.size)
             connection.setRequestProperty("Content-Type", "application/soap+xml; charset=utf-8")
-            connection.setRequestProperty("User-Agent", "LanDeviceDiscovery/2.1.0")
+            connection.setRequestProperty("User-Agent", "LanDeviceDiscovery/2.3.9")
             connection.outputStream.use { it.write(payload) }
             if (connection.responseCode !in 200..299) return null
             connection.inputStream.use { it.readBounded(MAX_RESPONSE_BYTES) }

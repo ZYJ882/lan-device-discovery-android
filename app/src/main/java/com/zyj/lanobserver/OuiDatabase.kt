@@ -185,7 +185,7 @@ class OuiDatabase(context: Context) {
         const val KEY_LAST_SYNC = "last_sync"
         const val CONNECT_TIMEOUT_MILLIS = 10_000
         const val READ_TIMEOUT_MILLIS = 20_000
-        const val USER_AGENT = "LanDeviceDiscovery/2.3.1 (Android; manual IEEE OUI sync)"
+        const val USER_AGENT = "LanDeviceDiscovery/2.3.9 (Android; manual IEEE OUI sync)"
         val IEEE_REGISTRIES = listOf(
             OuiRegistry("MA-L", "https://standards-oui.ieee.org/oui/oui.csv"),
             OuiRegistry("MA-M", "https://standards-oui.ieee.org/oui28/mam.csv"),

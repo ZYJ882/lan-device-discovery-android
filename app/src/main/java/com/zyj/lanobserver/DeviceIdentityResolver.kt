@@ -42,7 +42,7 @@ class DeviceIdentityResolver {
             connection.connectTimeout = CONNECT_TIMEOUT_MILLIS
             connection.readTimeout = READ_TIMEOUT_MILLIS
             connection.requestMethod = "GET"
-            connection.setRequestProperty("User-Agent", "LanDeviceDiscovery/2.0")
+            connection.setRequestProperty("User-Agent", "LanDeviceDiscovery/2.3.9")
             connection.inputStream.use { input -> input.readBounded(MAX_DESCRIPTION_BYTES) }
         }.getOrElse {
             diagnostics?.sourceFailure("SSDP", "UPnP description request failed ip=$responderAddress reason=${it.javaClass.simpleName}")
